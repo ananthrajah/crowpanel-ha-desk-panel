@@ -1,0 +1,398 @@
+# ═════════════════════════════════════════════════════════════════════════════
+# Desk Panel — Home Assistant package
+# VERSION: 3.0.0   (2026-10-18)   Pairs with crowpanel-desk.yaml v3.x · desktop app v0.2+
+# Project page: https://github.com/ananthrajah/crowpanel-ha-desk-panel
+# Install as /config/packages/desk_panel.yaml (replace the old file), then
+# Developer Tools > YAML > "Check configuration", then restart HA (first time
+# only for the new script/template entities; later edits just need a reload).
+#
+# CHANGELOG
+#   3.0.0  2026-10-18  Panel layout from the desktop app: sensor.desk_panel_layout_store
+#                      (saved by the app via the desk_panel_layout_set event; survives
+#                      restarts), sensor.desk_panel_layout (compact per-page labels /
+#                      entities / live on-off string for the panel), script.desk_panel_tap
+#                      (toggle / run / press depending on the entity type).
+#   2.1.1  2026-10-17  Album art via HA's image proxy; no longer rewrites the Music
+#                      Assistant ?size= parameter (caused HTTP 400 on some images).
+#   2.1.0  2026-10-17  desk_panel_play_pause: the panel's Play button resumes if
+#                      something is queued, otherwise starts "Liked Songs" (or the
+#                      first playlist of the current source) shuffled.
+#   2.0.0  2026-10-17  Music source selector + live playlist library from Music
+#                      Assistant; speaker grouping script; radio-mode script;
+#                      progress/duration/repeat/members on the now-playing sensor;
+#                      album art uses HA's local IP and a 260 px thumbnail.
+#   1.0.0  2026-10-15  Player selector + now-playing sensor.
+# ═════════════════════════════════════════════════════════════════════════════
+
+input_select:
+  desk_panel_player:
+    name: Desk panel player
+    icon: mdi:speaker
+    # CHANGE THESE: the same 4 speakers, in the same order, as speaker_1..4 in the
+    # ESPHome YAML (Music Assistant media_player entities work best).
+    options:
+      - media_player.living_room
+      - media_player.office
+      - media_player.whole_house       # e.g. a Music Assistant group
+      - media_player.kitchen
+
+  desk_panel_source:
+    name: Desk panel music source
+    icon: mdi:music-box-multiple
+    options:
+      - Spotify
+      - YouTube Music
+      - Mixes          # Music Assistant's own smart playlists (Infinite Mix, Random…)
+
+script:
+  # Panel button tap: do the right thing for each entity type.
+  desk_panel_tap:
+    alias: Desk panel - tap button
+    mode: parallel
+    fields:
+      entity:
+        description: entity_id from the panel layout
+    sequence:
+      - variables:
+          dom: "{{ entity.split('.')[0] }}"
+      - choose:
+          - conditions: "{{ dom in ['scene', 'script'] }}"
+            sequence:
+              - action: "{{ dom }}.turn_on"
+                target:
+                  entity_id: "{{ entity }}"
+          - conditions: "{{ dom in ['button', 'input_button'] }}"
+            sequence:
+              - action: "{{ dom }}.press"
+                target:
+                  entity_id: "{{ entity }}"
+          - conditions: "{{ dom == 'lock' }}"
+            sequence:
+              - action: "{{ 'lock.unlock' if is_state(entity, 'locked') else 'lock.lock' }}"
+                target:
+                  entity_id: "{{ entity }}"
+          - conditions: "{{ dom == 'media_player' }}"
+            sequence:
+              - action: media_player.media_play_pause
+                target:
+                  entity_id: "{{ entity }}"
+        default:
+          - action: homeassistant.toggle
+            target:
+              entity_id: "{{ entity }}"
+
+  # Panel Play button. An idle Music Assistant player with an empty queue ignores
+  # media_play_pause, so start something instead.
+  desk_panel_play_pause:
+    alias: Desk panel - play/pause
+    mode: restart
+    sequence:
+      - variables:
+          player: "{{ states('input_select.desk_panel_player') }}"
+          st: "{{ states(player) }}"
+          names: '{{ (state_attr("sensor.desk_panel_playlists", "names") or "").split("\n") }}'
+          uris: '{{ (state_attr("sensor.desk_panel_playlists", "uris") or "").split("\n") }}'
+          liked: >-
+            {% set ns = namespace(u='') %}
+            {% for n in names %}{% if 'Liked Songs' in n and not ns.u %}{% set ns.u = uris[loop.index0] %}{% endif %}{% endfor %}
+            {{ ns.u or (uris[0] if uris | length > 0 else '') }}
+      - if:
+          - condition: template
+            value_template: "{{ st in ['playing', 'paused'] }}"
+        then:
+          - action: media_player.media_play_pause
+            target:
+              entity_id: "{{ player }}"
+        else:
+          - condition: template
+            value_template: "{{ liked | length > 0 }}"
+          - action: media_player.shuffle_set
+            target:
+              entity_id: "{{ player }}"
+            data:
+              shuffle: true
+            continue_on_error: true
+          - action: music_assistant.play_media
+            target:
+              entity_id: "{{ player }}"
+            data:
+              media_id: "{{ liked }}"
+              media_type: playlist
+              enqueue: replace
+
+  # Tap a speaker on the panel: join it to the main player's group, or remove it.
+  desk_panel_toggle_speaker:
+    alias: Desk panel - toggle speaker in group
+    mode: queued
+    fields:
+      speaker:
+        description: media_player to add/remove
+    sequence:
+      - variables:
+          main: "{{ states('input_select.desk_panel_player') }}"
+          members: "{{ state_attr(main, 'group_members') or [] }}"
+      - condition: template
+        value_template: "{{ speaker != main }}"
+      - if:
+          - condition: template
+            value_template: "{{ speaker in members }}"
+        then:
+          - action: media_player.unjoin
+            target:
+              entity_id: "{{ speaker }}"
+        else:
+          - action: media_player.join
+            target:
+              entity_id: "{{ main }}"
+            data:
+              group_members:
+                - "{{ speaker }}"
+
+  # Play the Nth playlist shown in the panel's Library list.
+  desk_panel_play_playlist:
+    alias: Desk panel - play playlist
+    mode: restart
+    fields:
+      index:
+        description: row number in the panel list
+      shuffle:
+        description: "true / false"
+    sequence:
+      - variables:
+          player: "{{ states('input_select.desk_panel_player') }}"
+          uris: '{{ (state_attr("sensor.desk_panel_playlists", "uris") or "").split("\n") }}'
+          i: "{{ index | int(0) }}"
+      - condition: template
+        value_template: "{{ uris[i] is defined and uris[i] | length > 0 }}"
+      - action: media_player.shuffle_set
+        target:
+          entity_id: "{{ player }}"
+        data:
+          shuffle: "{{ shuffle | string | lower == 'true' }}"
+        continue_on_error: true
+      - action: music_assistant.play_media
+        target:
+          entity_id: "{{ player }}"
+        data:
+          media_id: "{{ uris[i] }}"
+          media_type: playlist
+          enqueue: replace
+
+  # "More like this": Music Assistant radio mode from the current track or artist.
+  desk_panel_radio:
+    alias: Desk panel - radio mode
+    mode: restart
+    fields:
+      mode:
+        description: "track or artist"
+    sequence:
+      - variables:
+          player: "{{ states('input_select.desk_panel_player') }}"
+          track: "{{ state_attr(player, 'media_content_id') }}"
+          artist: "{{ state_attr(player, 'media_artist') }}"
+      - if:
+          - condition: template
+            value_template: "{{ mode == 'track' and track }}"
+        then:
+          - action: music_assistant.play_media
+            target:
+              entity_id: "{{ player }}"
+            data:
+              media_id: "{{ track }}"
+              media_type: track
+              radio_mode: true
+              enqueue: replace
+        else:
+          - condition: template
+            value_template: "{{ artist is not none and artist | length > 0 }}"
+          - action: music_assistant.play_media
+            target:
+              entity_id: "{{ player }}"
+            data:
+              media_id: "{{ artist }}"
+              media_type: artist
+              radio_mode: true
+              enqueue: replace
+
+template:
+  # ── Now playing (mirrors whichever player is selected) ──
+  - sensor:
+      - name: Desk panel now playing
+        unique_id: desk_panel_now_playing
+        icon: mdi:music
+        state: "{{ states(states('input_select.desk_panel_player')) }}"
+        attributes:
+          player: "{{ states('input_select.desk_panel_player') }}"
+          player_name: >-
+            {% set p = states('input_select.desk_panel_player') %}
+            {{ state_attr(p, 'friendly_name') or p }}
+          title: >-
+            {{ state_attr(states('input_select.desk_panel_player'), 'media_title') or '' }}
+          artist: >-
+            {{ state_attr(states('input_select.desk_panel_player'), 'media_artist') or '' }}
+          volume: >-
+            {{ ((state_attr(states('input_select.desk_panel_player'), 'volume_level') or 0) * 100) | round(0) | int }}
+          shuffle: >-
+            {{ state_attr(states('input_select.desk_panel_player'), 'shuffle') | default(false) }}
+          repeat: >-
+            {{ state_attr(states('input_select.desk_panel_player'), 'repeat') or 'off' }}
+          position: >-
+            {{ state_attr(states('input_select.desk_panel_player'), 'media_position') or 0 }}
+          duration: >-
+            {{ state_attr(states('input_select.desk_panel_player'), 'media_duration') or 0 }}
+          pos_ts: >-
+            {% set t = state_attr(states('input_select.desk_panel_player'), 'media_position_updated_at') %}
+            {{ as_timestamp(t, 0) | int if t else 0 }}
+          members: >-
+            {{ (state_attr(states('input_select.desk_panel_player'), 'group_members') or []) | join(',') }}
+          # Album art: full URL the ESP32 can fetch over plain http on your LAN.
+          # CHANGE ha_url below to your HA's local address (IP, not homeassistant.local). Music Assistant images are shrunk to 260 px.
+          # 2.1.1: go through HA's own image proxy (entity_picture_local) when it
+          # exists — HA fetches + caches the art and always serves a plain JPEG/PNG.
+          # Falls back to the player's own URL, unmodified.
+          picture: >-
+            {% set ha_url = 'http://192.168.1.10:8123' %}
+            {% set p = states('input_select.desk_panel_player') %}
+            {% set local = state_attr(p, 'entity_picture_local') %}
+            {% set pic = state_attr(p, 'entity_picture') %}
+            {% if local %}{{ ha_url }}{{ local }}
+            {% elif pic %}{{ pic if pic.startswith('http') else ha_url ~ pic }}
+            {% endif %}
+
+  # ── Playlist library for the panel (refreshes on source change, at startup,
+  #    every 30 min, and when the panel's Refresh button is pressed) ──
+  - triggers:
+      - trigger: homeassistant
+        event: start
+      - trigger: state
+        entity_id: input_select.desk_panel_source
+      - trigger: time_pattern
+        minutes: "/30"
+      - trigger: event
+        event_type: esphome.desk_panel_refresh_playlists
+    actions:
+      - action: music_assistant.get_library
+        data:
+          config_entry_id: 01KKCH823MW8DSBKNZXZADXT6E
+          media_type: playlist
+          limit: 200
+          order_by: name
+        response_variable: lib
+      # Music Assistant library URIs don't say which service a playlist came from,
+      # so the source is inferred from the cover-art host:
+      #   Spotify = scdn.co / spotifycdn.com, Mixes = MA's own image proxy,
+      #   YouTube Music = everything else (Google image hosts, or no image).
+      - variables:
+          picked: >-
+            {% set src = states('input_select.desk_panel_source') %}
+            {% set ns = namespace(items=[]) %}
+            {% for p in lib['items'] %}
+              {% set img = p.image or '' %}
+              {% set sp = 'scdn.co' in img or 'spotifycdn' in img %}
+              {% set mix = 'imageproxy' in img %}
+              {% set name = p.name | regex_replace('[^ -~]', '') | regex_replace('[(][^A-Za-z0-9)]*[)]', '') | trim %}
+              {% if name and ((src == 'Spotify' and sp) or (src == 'Mixes' and mix)
+                     or (src == 'YouTube Music' and not sp and not mix)) %}
+                {% set ns.items = ns.items + [{'n': name[:40], 'u': p.uri}] %}
+              {% endif %}
+            {% endfor %}
+            {{ ns.items }}
+    sensor:
+      - name: Desk panel playlists
+        unique_id: desk_panel_playlists
+        icon: mdi:playlist-music
+        state: "{{ picked | count }}"
+        attributes:
+          source: "{{ states('input_select.desk_panel_source') }}"
+          names: '{{ picked | map(attribute="n") | join("\n") }}'
+          uris: '{{ picked | map(attribute="u") | join("\n") }}'
+
+  # ── Panel layout (pages 1-4) — written by the Desk Panel desktop app ──
+  # The app fires `desk_panel_layout_set` with {pages: [{name, tiles: [{entity_id, label}]}]}.
+  # Trigger-based template sensors keep their attributes across HA restarts.
+  - triggers:
+      - trigger: event
+        event_type: desk_panel_layout_set
+    sensor:
+      - name: Desk panel layout store
+        unique_id: desk_panel_layout_store
+        icon: mdi:view-grid-outline
+        state: "{{ now().isoformat() }}"
+        attributes:
+          pages: >-
+            {% set ns = namespace(out=[]) %}
+            {% for pg in (trigger.event.data.pages or [])[:4] %}
+              {% set tl = namespace(t=[]) %}
+              {% for t in (pg.tiles or [])[:12] %}
+                {% if t.entity_id is defined and t.entity_id %}
+                  {% set tl.t = tl.t + [{'entity_id': t.entity_id | string, 'label': (t.label or '') | string}] %}
+                {% endif %}
+              {% endfor %}
+              {% set ns.out = ns.out + [{'name': (pg.name or '') | string, 'tiles': tl.t}] %}
+            {% endfor %}
+            {{ ns.out }}
+
+  # Compact, live view of the layout for the panel: per page a name, newline-joined
+  # labels + entity_ids, and one char per button: 1 = on, 0 = off, x = unavailable.
+  - sensor:
+      - name: Desk panel layout
+        unique_id: desk_panel_layout
+        icon: mdi:view-grid
+        state: "{{ (state_attr('sensor.desk_panel_layout_store', 'pages') or []) | count }}"
+        attributes:
+          p1_name: >-
+            {% set pages = state_attr('sensor.desk_panel_layout_store', 'pages') or [] %}
+            {{ (pages[0].name if pages | count > 0 else '') | regex_replace('[^ -~]', '') | trim }}
+          p1_entities: >-
+            {% set pages = state_attr('sensor.desk_panel_layout_store', 'pages') or [] %}{% set tiles = pages[0].tiles if pages | count > 0 else [] %}
+            {{ tiles | map(attribute='entity_id') | join("\n") }}
+          p1_labels: >-
+            {% set pages = state_attr('sensor.desk_panel_layout_store', 'pages') or [] %}{% set tiles = pages[0].tiles if pages | count > 0 else [] %}
+            {% set ns = namespace(l=[]) %}
+            {% for t in tiles %}{% set ns.l = ns.l + [((t.label or state_attr(t.entity_id, 'friendly_name') or t.entity_id) | regex_replace('[^ -~]', '') | trim)[:22]] %}{% endfor %}
+            {{ ns.l | join("\n") }}
+          p1_states: >-
+            {% set pages = state_attr('sensor.desk_panel_layout_store', 'pages') or [] %}{% set tiles = pages[0].tiles if pages | count > 0 else [] %}
+            {% for t in tiles %}{% set s = states(t.entity_id) %}{{ '1' if s in ['on', 'open', 'opening', 'playing', 'unlocked', 'heat', 'cool', 'heat_cool', 'auto', 'dry', 'fan_only', 'home'] else ('x' if s in ['unavailable', 'unknown'] else '0') }}{% endfor %}
+          p2_name: >-
+            {% set pages = state_attr('sensor.desk_panel_layout_store', 'pages') or [] %}
+            {{ (pages[1].name if pages | count > 1 else '') | regex_replace('[^ -~]', '') | trim }}
+          p2_entities: >-
+            {% set pages = state_attr('sensor.desk_panel_layout_store', 'pages') or [] %}{% set tiles = pages[1].tiles if pages | count > 1 else [] %}
+            {{ tiles | map(attribute='entity_id') | join("\n") }}
+          p2_labels: >-
+            {% set pages = state_attr('sensor.desk_panel_layout_store', 'pages') or [] %}{% set tiles = pages[1].tiles if pages | count > 1 else [] %}
+            {% set ns = namespace(l=[]) %}
+            {% for t in tiles %}{% set ns.l = ns.l + [((t.label or state_attr(t.entity_id, 'friendly_name') or t.entity_id) | regex_replace('[^ -~]', '') | trim)[:22]] %}{% endfor %}
+            {{ ns.l | join("\n") }}
+          p2_states: >-
+            {% set pages = state_attr('sensor.desk_panel_layout_store', 'pages') or [] %}{% set tiles = pages[1].tiles if pages | count > 1 else [] %}
+            {% for t in tiles %}{% set s = states(t.entity_id) %}{{ '1' if s in ['on', 'open', 'opening', 'playing', 'unlocked', 'heat', 'cool', 'heat_cool', 'auto', 'dry', 'fan_only', 'home'] else ('x' if s in ['unavailable', 'unknown'] else '0') }}{% endfor %}
+          p3_name: >-
+            {% set pages = state_attr('sensor.desk_panel_layout_store', 'pages') or [] %}
+            {{ (pages[2].name if pages | count > 2 else '') | regex_replace('[^ -~]', '') | trim }}
+          p3_entities: >-
+            {% set pages = state_attr('sensor.desk_panel_layout_store', 'pages') or [] %}{% set tiles = pages[2].tiles if pages | count > 2 else [] %}
+            {{ tiles | map(attribute='entity_id') | join("\n") }}
+          p3_labels: >-
+            {% set pages = state_attr('sensor.desk_panel_layout_store', 'pages') or [] %}{% set tiles = pages[2].tiles if pages | count > 2 else [] %}
+            {% set ns = namespace(l=[]) %}
+            {% for t in tiles %}{% set ns.l = ns.l + [((t.label or state_attr(t.entity_id, 'friendly_name') or t.entity_id) | regex_replace('[^ -~]', '') | trim)[:22]] %}{% endfor %}
+            {{ ns.l | join("\n") }}
+          p3_states: >-
+            {% set pages = state_attr('sensor.desk_panel_layout_store', 'pages') or [] %}{% set tiles = pages[2].tiles if pages | count > 2 else [] %}
+            {% for t in tiles %}{% set s = states(t.entity_id) %}{{ '1' if s in ['on', 'open', 'opening', 'playing', 'unlocked', 'heat', 'cool', 'heat_cool', 'auto', 'dry', 'fan_only', 'home'] else ('x' if s in ['unavailable', 'unknown'] else '0') }}{% endfor %}
+          p4_name: >-
+            {% set pages = state_attr('sensor.desk_panel_layout_store', 'pages') or [] %}
+            {{ (pages[3].name if pages | count > 3 else '') | regex_replace('[^ -~]', '') | trim }}
+          p4_entities: >-
+            {% set pages = state_attr('sensor.desk_panel_layout_store', 'pages') or [] %}{% set tiles = pages[3].tiles if pages | count > 3 else [] %}
+            {{ tiles | map(attribute='entity_id') | join("\n") }}
+          p4_labels: >-
+            {% set pages = state_attr('sensor.desk_panel_layout_store', 'pages') or [] %}{% set tiles = pages[3].tiles if pages | count > 3 else [] %}
+            {% set ns = namespace(l=[]) %}
+            {% for t in tiles %}{% set ns.l = ns.l + [((t.label or state_attr(t.entity_id, 'friendly_name') or t.entity_id) | regex_replace('[^ -~]', '') | trim)[:22]] %}{% endfor %}
+            {{ ns.l | join("\n") }}
+          p4_states: >-
+            {% set pages = state_attr('sensor.desk_panel_layout_store', 'pages') or [] %}{% set tiles = pages[3].tiles if pages | count > 3 else [] %}
+            {% for t in tiles %}{% set s = states(t.entity_id) %}{{ '1' if s in ['on', 'open', 'opening', 'playing', 'unlocked', 'heat', 'cool', 'heat_cool', 'auto', 'dry', 'fan_only', 'home'] else ('x' if s in ['unavailable', 'unknown'] else '0') }}{% endfor %}

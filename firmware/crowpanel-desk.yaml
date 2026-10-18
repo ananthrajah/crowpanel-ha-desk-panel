@@ -1,0 +1,2973 @@
+# ═════════════════════════════════════════════════════════════════════════════
+# Desk Panel - Elecrow CrowPanel 7" Basic V3.0 (DIS08070H, ESP32-S3 N4R8)
+# VERSION: 3.0.1   (2026-10-18)
+# Pairs with HA package: desk_panel.yaml v3.0.0 or newer  ·  desktop app v0.2.0+
+# Built & compile-tested against ESPHome 2026.9.1
+#
+# CHANGELOG
+#   3.0.1  2026-10-18  "Panel config version" now shows in HA (was "unknown").
+#                      Speakers are set once in substitutions (speaker_1..4).
+#   3.0.0  2026-10-17  Pages 1-4 are now laid out from the Desk Panel desktop app (via
+#                      HA): 12 buttons each (4x3), names/labels/entities change live with
+#                      no reflash. Fixed Office/Home pages removed. Bottom bar is now
+#                      8 buttons with the page names. Needs HA package 3.0.0 and
+#                      desk_layout.h. Buttons call script.desk_panel_tap (toggle/run).
+#   2.2.0  2026-10-17  Music page: speaker dropdown (pick directly instead of cycling)
+#                      and Spotify / YouTube source buttons (sets what Play and the
+#                      Library tab use).
+#   2.1.2  2026-10-17  Switch tiles always match HA: repainted on boot/reconnect,
+#                      on wake from sleep, every 5 s, and 1.5 s after each tap
+#                      (so a failed toggle snaps back instead of showing wrong).
+#   2.1.1  2026-10-17  Office page: + Kids Room light (Meross).
+#   2.1.0  2026-10-17  Office page: Meross switches only (Mancave 1, Mancave 2,
+#                      Monitor, + Guest Room). Play button now starts music when
+#                      the player's queue is empty (needs HA package 2.1.0).
+#   2.0.2  2026-10-17  Silence harmless snprintf truncation warnings in the
+#                      progress-time labels (bigger buffer, no negative values).
+#   2.0.1  2026-10-17  Fix: Wi-Fi failed to start (out of internal RAM) after the
+#                      v2.0.0 feature additions. PSRAM malloc enabled, Wi-Fi/LWIP
+#                      buffers in PSRAM, 64 KB data cache reverted. Heap sensors added.
+#   2.0.0  2026-10-17  Versioning (shows in HA device info + on-screen).
+#                      Pages: Office, Main Floor, Music, Library, Speakers, Climate.
+#                      Music: progress bar + seek, elapsed/remaining, repeat, shuffle,
+#                        "Track radio" / "Artist radio" (Music Assistant radio mode).
+#                      Library: browse Spotify / YouTube Music / Mixes playlists live
+#                        from Music Assistant, tap to play.
+#                      Speakers: join/unjoin speakers into a group + per-speaker volume.
+#                      Climate: thermostat page (placeholder entity until Nest is in HA).
+#                      Screen sleeps after 10 min (adjustable from HA), wakes on touch.
+#   1.3.0  2026-10-16  Black theme (no dark-grey fills -> no shimmer), faster touch
+#                      polling, 400 kHz I2C, 64 KB data cache, diagnostics removed.
+#   1.2.0  2026-10-16  V3.0 touch fixes: logger on UART0, GPIO19/20 reset at boot,
+#                      Elecrow PCA9557 touch reset sequence.
+#   1.0.0  2026-10-15  First version: Home + Music pages.
+#
+# Project page: https://github.com/ananthrajah/crowpanel-ha-desk-panel
+# Files needed in /config/esphome/: this file, usb_disable.h, desk_layout.h
+# HA side: /config/packages/desk_panel.yaml, and "Allow the device to perform
+# Home Assistant actions" enabled on this device in the ESPHome integration.
+# ═════════════════════════════════════════════════════════════════════════════
+
+substitutions:
+  version: "3.0.1"
+  name: crowpanel-desk
+  friendly_name: Desk Panel
+  now_playing: sensor.desk_panel_now_playing
+  playlists: sensor.desk_panel_playlists
+  # Thermostat - PLACEHOLDER. Replace once your Google/Nest thermostat is in HA
+  # (Matter pairing from the Google Home app, or the Google Nest integration).
+  thermostat: climate.home_thermostat
+  temp_step: "0.5"
+  # Layout of pages 1-4 comes from HA (edited in the Desk Panel desktop app)
+  layout: sensor.desk_panel_layout
+  # ── CHANGE THESE: your speakers (Music Assistant media_player entities) ──
+  # Same 4 entities, same order, as input_select.desk_panel_player in the HA package.
+  # Music tab dropdown = all 4. Speakers tab (group + volume) = 1, 2 and 4
+  # (3 is meant for an existing Music Assistant group / sync group).
+  speaker_1: media_player.living_room
+  speaker_1_name: "Living Room"
+  speaker_2: media_player.office
+  speaker_2_name: "Office"
+  speaker_3: media_player.whole_house
+  speaker_3_name: "Whole house (group)"
+  speaker_4: media_player.kitchen
+  speaker_4_name: "Kitchen"
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  project:
+    name: "ananthrajah.crowpanel_desk_panel"
+    version: "${version}"
+  platformio_options:
+    board_build.esp-idf.memory_type: qio_opi
+    board_build.flash_mode: dio
+  includes:
+    - usb_disable.h
+    - desk_layout.h
+  on_boot:
+    # Before the I2C bus starts (bus = 1000): give GPIO19/20 back to plain GPIO.
+    - priority: 1001
+      then:
+        - lambda: |-
+            gpio_reset_pin(GPIO_NUM_19);
+            gpio_reset_pin(GPIO_NUM_20);
+            gpio_set_direction(GPIO_NUM_38, GPIO_MODE_OUTPUT);
+            gpio_set_level(GPIO_NUM_38, 0);
+            delay(50);
+            gpio_set_direction(GPIO_NUM_38, GPIO_MODE_INPUT);
+            delay(100);
+    # Start on page 1 with its bottom-bar button highlighted
+    - priority: -100
+      then:
+        - script.execute: { id: set_nav, idx: 0 }
+        - text_sensor.template.publish: { id: cfg_version, state: "${version}" }
+    # Elecrow V3.0 touch reset via PCA9557 (0x18): IO0 = GT911 RST, IO1 = GT911 INT.
+    # Priority 800 = after the I2C bus, before the touchscreen (600).
+    - priority: 800
+      then:
+        - lambda: |-
+            auto *bus = id(touch_i2c);
+            const uint8_t out_low[2]  = {0x01, 0x00};
+            const uint8_t cfg_out[2]  = {0x03, 0xFC};
+            const uint8_t rst_high[2] = {0x01, 0x01};
+            const uint8_t int_in[2]   = {0x03, 0xFE};
+            bus->write(0x18, out_low, 2);
+            bus->write(0x18, cfg_out, 2);
+            delay(20);
+            bus->write(0x18, rst_high, 2);
+            delay(10);
+            bus->write(0x18, int_in, 2);
+            delay(100);
+
+esp32:
+  board: esp32-s3-devkitc-1
+  flash_size: 4MB
+  cpu_frequency: 240MHz
+  framework:
+    type: esp-idf
+    advanced:
+      execute_from_psram: true
+    sdkconfig_options:
+      # v2.0.1: internal RAM was running out before Wi-Fi started (ESP_ERR_NO_MEM).
+      # Let ordinary allocations use PSRAM (keep small ones + a reserve internal),
+      # put Wi-Fi/LWIP buffers in PSRAM when possible, and give back the 32 KB
+      # that the 64 KB data cache was taking from internal RAM.
+      CONFIG_SPIRAM_USE_CAPS_ALLOC: n
+      CONFIG_SPIRAM_USE_MALLOC: y
+      CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL: "2048"
+      CONFIG_SPIRAM_MALLOC_RESERVE_INTERNAL: "49152"
+      CONFIG_SPIRAM_TRY_ALLOCATE_WIFI_LWIP: y
+
+psram:
+  mode: octal
+  speed: 80MHz
+
+logger:
+  level: INFO
+  hardware_uart: UART0  # REQUIRED on this board (USB-JTAG default breaks the touch I2C bus)
+
+api:
+  encryption:
+    key: !secret desk_panel_api_key
+  # After a reboot / reconnect HA re-sends every state; repaint once they've arrived.
+  on_client_connected:
+    - delay: 3s
+    - script.execute: sync_dyn
+
+ota:
+  - platform: esphome
+    encryption: {}
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  power_save_mode: none
+  ap:
+    ssid: "DeskPanel-Fallback"
+
+captive_portal:
+
+http_request:
+  verify_ssl: false
+  timeout: 10s
+
+time:
+  - platform: homeassistant
+    id: ha_time
+
+# Memory health (shows in HA under the device's diagnostic entities)
+debug:
+  update_interval: 60s
+
+globals:
+  - id: np_pos        # media_position (s) at np_ts
+    type: float
+    initial_value: '0'
+  - id: np_dur        # media_duration (s)
+    type: float
+    initial_value: '0'
+  - id: np_ts         # unix time media_position was reported
+    type: float
+    initial_value: '0'
+  - id: np_now_pos    # computed live position (s)
+    type: float
+    initial_value: '0'
+  - id: seeking       # true while the user drags the progress slider
+    type: bool
+    initial_value: 'false'
+
+# ───────────── Display / touch / backlight ─────────────
+i2c:
+  - id: touch_i2c
+    sda: 19
+    scl: 20
+    scan: false
+    frequency: 400kHz
+
+display:
+  - platform: mipi_rgb
+    model: RPI
+    id: my_display
+    invert_colors: true
+    dimensions:
+      width: 800
+      height: 480
+    de_pin: 41
+    hsync_pin: 39
+    vsync_pin: 40
+    pclk_pin: 0
+    pclk_frequency: 15MHz
+    pclk_inverted: true
+    hsync_front_porch: 40
+    hsync_pulse_width: 48
+    hsync_back_porch: 13
+    vsync_front_porch: 1
+    vsync_pulse_width: 31
+    vsync_back_porch: 13
+    data_pins:
+      red: [14, 21, 47, 48, 45]
+      green: [9, 46, 3, 8, 16, 1]
+      blue: [15, 7, 6, 5, 4]
+    color_order: RGB
+    auto_clear_enabled: false
+    update_interval: never
+
+touchscreen:
+  - platform: gt911
+    id: my_touchscreen
+    i2c_id: touch_i2c
+    address: 0x5D
+    display: my_display
+    update_interval: 20ms
+    calibration:
+      x_min: 0
+      x_max: 800
+      y_min: 0
+      y_max: 480
+    # Wake from sleep on any touch. While LVGL is paused it ignores input, so the
+    # waking tap never presses a button underneath.
+    on_release:
+      - if:
+          condition: lvgl.is_paused
+          then:
+            - lvgl.resume:
+            - script.execute: sync_dyn
+            - lvgl.widget.redraw:
+            - light.turn_on: backlight
+
+output:
+  - platform: ledc
+    pin: 2
+    id: backlight_pwm
+    frequency: 1220Hz
+
+light:
+  - platform: monochromatic
+    output: backlight_pwm
+    name: "Display Backlight"
+    id: backlight
+    restore_mode: ALWAYS_ON
+    default_transition_length: 250ms
+
+# Screen timeout, adjustable from HA (Settings > Devices > Desk Panel)
+number:
+  - platform: template
+    name: "Screen timeout"
+    id: screen_timeout
+    icon: mdi:timer-sand
+    unit_of_measurement: min
+    min_value: 1
+    max_value: 60
+    step: 1
+    initial_value: 10
+    optimistic: true
+    restore_value: true
+    entity_category: config
+
+button:
+  - platform: template
+    name: "Refresh playlists"
+    icon: mdi:playlist-music
+    on_press:
+      - homeassistant.event:
+          event: esphome.desk_panel_refresh_playlists
+
+# ───────────── Album art ─────────────
+image:
+  - platform: online_image
+    id: album_art
+    url: "http://127.0.0.1/placeholder.jpg"
+    format: JPEG
+    type: RGB565
+    resize: 260x260
+    update_interval: never
+    on_download_finished:
+      - lvgl.image.update:
+          id: art_img
+          src: album_art
+      - lvgl.widget.show: art_img
+    on_error:
+      - lvgl.widget.hide: art_img
+
+# ───────────── Data from Home Assistant ─────────────
+text_sensor:
+  - platform: debug
+    reset_reason:
+      name: "Reset reason"
+  - platform: version
+    name: "ESPHome version"
+    hide_timestamp: true
+  - platform: template
+    name: "Panel config version"
+    id: cfg_version
+    icon: mdi:tag
+    entity_category: diagnostic
+    update_interval: never
+    lambda: 'return {"${version}"};'
+
+  # Now playing
+  - platform: homeassistant
+    id: np_state
+    entity_id: ${now_playing}
+    on_value:
+      - lvgl.label.update:
+          id: play_icon
+          text: !lambda |-
+            std::string s = (x == "playing") ? "" : "";
+            return s;
+  - platform: homeassistant
+    id: np_player
+    entity_id: ${now_playing}
+    attribute: player
+    on_value:
+      - lvgl.dropdown.update:
+          id: player_dd
+          selected_index: !lambda |-
+            static const char *const ents[] = {"${speaker_1}", "${speaker_2}", "${speaker_3}", "${speaker_4}"};
+            for (int i = 0; i < 4; i++) if (x == ents[i]) return i;
+            return 0;
+  - platform: homeassistant
+    id: np_player_name
+    entity_id: ${now_playing}
+    attribute: player_name
+    on_value:
+      - lvgl.label.update:
+          id: spk_main_lbl
+          text: !lambda |-
+            std::string s = "Main speaker: " + x + "   (pick it on the Music page)";
+            return s;
+  - platform: homeassistant
+    id: np_title
+    entity_id: ${now_playing}
+    attribute: title
+    on_value:
+      - lvgl.label.update:
+          id: title_lbl
+          text: !lambda |-
+            std::string s = x.empty() ? std::string("Nothing playing") : x;
+            return s;
+  - platform: homeassistant
+    id: np_artist
+    entity_id: ${now_playing}
+    attribute: artist
+    on_value:
+      - lvgl.label.update:
+          id: artist_lbl
+          text: !lambda |-
+            std::string s = x;
+            return s;
+  - platform: homeassistant
+    id: np_shuffle
+    entity_id: ${now_playing}
+    attribute: shuffle
+    on_value:
+      - lvgl.widget.update:
+          id: shuffle_btn
+          state:
+            checked: !lambda 'return x == "True" || x == "true";'
+  - platform: homeassistant
+    id: np_repeat
+    entity_id: ${now_playing}
+    attribute: repeat
+    on_value:
+      - lvgl.widget.update:
+          id: repeat_btn
+          state:
+            checked: !lambda 'return x == "all" || x == "one";'
+      - lvgl.label.update:
+          id: repeat_lbl
+          text: !lambda |-
+            std::string s = (x == "one") ? " 1" : "";
+            return s;
+  - platform: homeassistant
+    id: np_members
+    entity_id: ${now_playing}
+    attribute: members
+    on_value:
+      - lvgl.widget.update:
+          id: grp_sp1
+          state:
+            checked: !lambda 'return x.find("${speaker_1}") != std::string::npos;'
+      - lvgl.widget.update:
+          id: grp_sp2
+          state:
+            checked: !lambda 'return x.find("${speaker_2}") != std::string::npos;'
+      - lvgl.widget.update:
+          id: grp_sp3
+          state:
+            checked: !lambda 'return x.find("${speaker_4}") != std::string::npos;'
+  - platform: homeassistant
+    id: np_picture
+    entity_id: ${now_playing}
+    attribute: picture
+    on_value:
+      - if:
+          condition:
+            lambda: 'return !x.empty();'
+          then:
+            - online_image.set_url:
+                id: album_art
+                url: !lambda 'return x;'
+            - component.update: album_art
+          else:
+            - lvgl.widget.hide: art_img
+
+  # Playlist library
+  - platform: homeassistant
+    id: pl_names
+    entity_id: ${playlists}
+    attribute: names
+    on_value:
+      - lambda: |-
+          std::string opts = x.empty() ? std::string("(no playlists - tap Refresh)") : x;
+          lv_roller_set_options(id(pl_roller)->obj, opts.c_str(), LV_ROLLER_MODE_NORMAL);
+  - platform: homeassistant
+    id: pl_source
+    entity_id: input_select.desk_panel_source
+    on_value:
+      - script.execute: sync_source
+      - lvgl.label.update:
+          id: src_lbl
+          text: !lambda |-
+            std::string s = "Source: " + x + "  ";
+            return s;
+
+  # Pages 1-4 layout (from the desktop app, via HA)
+  - platform: homeassistant
+    id: dp1_name
+    entity_id: ${layout}
+    attribute: p1_name
+    on_value:
+      - lvgl.label.update:
+          id: dp1_title
+          text: !lambda |-
+            std::string s = x.empty() ? std::string("Page 1") : x;
+            return s;
+      - lvgl.label.update:
+          id: navl_0
+          text: !lambda |-
+            std::string s = x.empty() ? std::string("Page 1") : x;
+            return s;
+  - platform: homeassistant
+    id: dp1_labels
+    entity_id: ${layout}
+    attribute: p1_labels
+    on_value:
+      - script.execute: sync_dyn
+  - platform: homeassistant
+    id: dp1_ents
+    entity_id: ${layout}
+    attribute: p1_entities
+    on_value:
+      - script.execute: sync_dyn
+  - platform: homeassistant
+    id: dp1_states
+    entity_id: ${layout}
+    attribute: p1_states
+    on_value:
+      - script.execute: sync_dyn
+  - platform: homeassistant
+    id: dp2_name
+    entity_id: ${layout}
+    attribute: p2_name
+    on_value:
+      - lvgl.label.update:
+          id: dp2_title
+          text: !lambda |-
+            std::string s = x.empty() ? std::string("Page 2") : x;
+            return s;
+      - lvgl.label.update:
+          id: navl_1
+          text: !lambda |-
+            std::string s = x.empty() ? std::string("Page 2") : x;
+            return s;
+  - platform: homeassistant
+    id: dp2_labels
+    entity_id: ${layout}
+    attribute: p2_labels
+    on_value:
+      - script.execute: sync_dyn
+  - platform: homeassistant
+    id: dp2_ents
+    entity_id: ${layout}
+    attribute: p2_entities
+    on_value:
+      - script.execute: sync_dyn
+  - platform: homeassistant
+    id: dp2_states
+    entity_id: ${layout}
+    attribute: p2_states
+    on_value:
+      - script.execute: sync_dyn
+  - platform: homeassistant
+    id: dp3_name
+    entity_id: ${layout}
+    attribute: p3_name
+    on_value:
+      - lvgl.label.update:
+          id: dp3_title
+          text: !lambda |-
+            std::string s = x.empty() ? std::string("Page 3") : x;
+            return s;
+      - lvgl.label.update:
+          id: navl_2
+          text: !lambda |-
+            std::string s = x.empty() ? std::string("Page 3") : x;
+            return s;
+  - platform: homeassistant
+    id: dp3_labels
+    entity_id: ${layout}
+    attribute: p3_labels
+    on_value:
+      - script.execute: sync_dyn
+  - platform: homeassistant
+    id: dp3_ents
+    entity_id: ${layout}
+    attribute: p3_entities
+    on_value:
+      - script.execute: sync_dyn
+  - platform: homeassistant
+    id: dp3_states
+    entity_id: ${layout}
+    attribute: p3_states
+    on_value:
+      - script.execute: sync_dyn
+  - platform: homeassistant
+    id: dp4_name
+    entity_id: ${layout}
+    attribute: p4_name
+    on_value:
+      - lvgl.label.update:
+          id: dp4_title
+          text: !lambda |-
+            std::string s = x.empty() ? std::string("Page 4") : x;
+            return s;
+      - lvgl.label.update:
+          id: navl_3
+          text: !lambda |-
+            std::string s = x.empty() ? std::string("Page 4") : x;
+            return s;
+  - platform: homeassistant
+    id: dp4_labels
+    entity_id: ${layout}
+    attribute: p4_labels
+    on_value:
+      - script.execute: sync_dyn
+  - platform: homeassistant
+    id: dp4_ents
+    entity_id: ${layout}
+    attribute: p4_entities
+    on_value:
+      - script.execute: sync_dyn
+  - platform: homeassistant
+    id: dp4_states
+    entity_id: ${layout}
+    attribute: p4_states
+    on_value:
+      - script.execute: sync_dyn
+
+  # Thermostat
+  - platform: homeassistant
+    id: th_mode
+    entity_id: ${thermostat}
+    on_value:
+      - lvgl.label.update:
+          id: th_mode_lbl
+          text: !lambda |-
+            std::string s;
+            if (x == "unavailable" || x == "unknown" || x.empty())
+              s = "Thermostat not connected yet";
+            else
+              s = "Mode: " + x;
+            return s;
+      - lvgl.widget.update:
+          id: th_heat
+          state:
+            checked: !lambda 'return x == "heat";'
+      - lvgl.widget.update:
+          id: th_cool
+          state:
+            checked: !lambda 'return x == "cool";'
+      - lvgl.widget.update:
+          id: th_auto
+          state:
+            checked: !lambda 'return x == "heat_cool";'
+      - lvgl.widget.update:
+          id: th_off
+          state:
+            checked: !lambda 'return x == "off";'
+  - platform: homeassistant
+    id: th_action
+    entity_id: ${thermostat}
+    attribute: hvac_action
+    on_value:
+      - lvgl.label.update:
+          id: th_action_lbl
+          text: !lambda |-
+            std::string s = x.empty() ? std::string("") : ("Now: " + x);
+            return s;
+
+sensor:
+  - platform: debug
+    free:
+      name: "Free internal heap"
+    block:
+      name: "Largest internal block"
+    psram:
+      name: "Free PSRAM"
+  - platform: homeassistant
+    id: np_volume
+    entity_id: ${now_playing}
+    attribute: volume
+    on_value:
+      - lvgl.slider.update:
+          id: vol_slider
+          value: !lambda 'return x;'
+      - lvgl.label.update:
+          id: vol_lbl
+          text: !lambda |-
+            std::string s = esphome::to_string((int) x) + "%";
+            return s;
+  - platform: homeassistant
+    id: np_position
+    entity_id: ${now_playing}
+    attribute: position
+    on_value:
+      - lambda: 'id(np_pos) = x;'
+  - platform: homeassistant
+    id: np_duration
+    entity_id: ${now_playing}
+    attribute: duration
+    on_value:
+      - lambda: 'id(np_dur) = x;'
+  - platform: homeassistant
+    id: np_position_ts
+    entity_id: ${now_playing}
+    attribute: pos_ts
+    on_value:
+      - lambda: 'id(np_ts) = x;'
+  - platform: homeassistant
+    id: vol_sp1
+    entity_id: ${speaker_1}
+    attribute: volume_level
+    on_value:
+      - lvgl.slider.update:
+          id: sl_sp1
+          value: !lambda 'return x * 100;'
+  - platform: homeassistant
+    id: vol_sp2
+    entity_id: ${speaker_2}
+    attribute: volume_level
+    on_value:
+      - lvgl.slider.update:
+          id: sl_sp2
+          value: !lambda 'return x * 100;'
+  - platform: homeassistant
+    id: vol_sp3
+    entity_id: ${speaker_4}
+    attribute: volume_level
+    on_value:
+      - lvgl.slider.update:
+          id: sl_sp3
+          value: !lambda 'return x * 100;'
+  - platform: homeassistant
+    id: th_current
+    entity_id: ${thermostat}
+    attribute: current_temperature
+    on_value:
+      - lvgl.label.update:
+          id: th_current_lbl
+          text: !lambda |-
+            char b[16]; snprintf(b, sizeof(b), "%.1f°", x);
+            return std::string(b);
+  - platform: homeassistant
+    id: th_target
+    entity_id: ${thermostat}
+    attribute: temperature
+    on_value:
+      - lvgl.label.update:
+          id: th_target_lbl
+          text: !lambda |-
+            char b[24]; snprintf(b, sizeof(b), "Set %.1f°", x);
+            return std::string(b);
+
+# Live progress bar (1 s tick; position is extrapolated between HA updates)
+interval:
+  # Safety net: repaint the layout pages every 5 s so they can never drift from HA.
+  - interval: 5s
+    then:
+      - script.execute: sync_dyn
+  - interval: 1s
+    then:
+      - lambda: |-
+          float pos = id(np_pos);
+          if (id(np_state).state == "playing") {
+            auto now = id(ha_time).now();
+            if (now.is_valid() && id(np_ts) > 0) pos += (float) now.timestamp - id(np_ts);
+          }
+          if (pos < 0) pos = 0;
+          if (id(np_dur) > 0 && pos > id(np_dur)) pos = id(np_dur);
+          id(np_now_pos) = pos;
+      - if:
+          condition:
+            lambda: 'return !id(seeking) && id(np_dur) > 0;'
+          then:
+            - lvgl.slider.update:
+                id: prog_slider
+                value: !lambda 'return id(np_now_pos) * 1000.0f / id(np_dur);'
+      - lvgl.label.update:
+          id: elapsed_lbl
+          text: !lambda |-
+            int p = std::max(0, (int) id(np_now_pos));
+            char b[20]; snprintf(b, sizeof(b), "%d:%02d", p / 60, p % 60);
+            return std::string(b);
+      - lvgl.label.update:
+          id: remain_lbl
+          text: !lambda |-
+            if (id(np_dur) <= 0) return std::string("--:--");
+            int r = std::max(0, (int) (id(np_dur) - id(np_now_pos)));
+            char b[20]; snprintf(b, sizeof(b), "-%d:%02d", r / 60, r % 60);
+            return std::string(b);
+
+# Reusable actions
+script:
+  # Re-paint pages 1-4 (labels + green/black) from the latest HA layout sensor.
+  - id: sync_dyn
+    mode: restart
+    then:
+      - lambda: |-
+            { lv_obj_t *const b[] = {id(dp1_b0), id(dp1_b1), id(dp1_b2), id(dp1_b3), id(dp1_b4), id(dp1_b5), id(dp1_b6), id(dp1_b7), id(dp1_b8), id(dp1_b9), id(dp1_b10), id(dp1_b11)};
+              lv_obj_t *const l[] = {id(dp1_l0), id(dp1_l1), id(dp1_l2), id(dp1_l3), id(dp1_l4), id(dp1_l5), id(dp1_l6), id(dp1_l7), id(dp1_l8), id(dp1_l9), id(dp1_l10), id(dp1_l11)};
+              desk_layout::apply_labels(b, l, 12, id(dp1_labels).state, id(dp1_ents).state);
+              desk_layout::apply_states(b, 12, id(dp1_states).state); }
+            { lv_obj_t *const b[] = {id(dp2_b0), id(dp2_b1), id(dp2_b2), id(dp2_b3), id(dp2_b4), id(dp2_b5), id(dp2_b6), id(dp2_b7), id(dp2_b8), id(dp2_b9), id(dp2_b10), id(dp2_b11)};
+              lv_obj_t *const l[] = {id(dp2_l0), id(dp2_l1), id(dp2_l2), id(dp2_l3), id(dp2_l4), id(dp2_l5), id(dp2_l6), id(dp2_l7), id(dp2_l8), id(dp2_l9), id(dp2_l10), id(dp2_l11)};
+              desk_layout::apply_labels(b, l, 12, id(dp2_labels).state, id(dp2_ents).state);
+              desk_layout::apply_states(b, 12, id(dp2_states).state); }
+            { lv_obj_t *const b[] = {id(dp3_b0), id(dp3_b1), id(dp3_b2), id(dp3_b3), id(dp3_b4), id(dp3_b5), id(dp3_b6), id(dp3_b7), id(dp3_b8), id(dp3_b9), id(dp3_b10), id(dp3_b11)};
+              lv_obj_t *const l[] = {id(dp3_l0), id(dp3_l1), id(dp3_l2), id(dp3_l3), id(dp3_l4), id(dp3_l5), id(dp3_l6), id(dp3_l7), id(dp3_l8), id(dp3_l9), id(dp3_l10), id(dp3_l11)};
+              desk_layout::apply_labels(b, l, 12, id(dp3_labels).state, id(dp3_ents).state);
+              desk_layout::apply_states(b, 12, id(dp3_states).state); }
+            { lv_obj_t *const b[] = {id(dp4_b0), id(dp4_b1), id(dp4_b2), id(dp4_b3), id(dp4_b4), id(dp4_b5), id(dp4_b6), id(dp4_b7), id(dp4_b8), id(dp4_b9), id(dp4_b10), id(dp4_b11)};
+              lv_obj_t *const l[] = {id(dp4_l0), id(dp4_l1), id(dp4_l2), id(dp4_l3), id(dp4_l4), id(dp4_l5), id(dp4_l6), id(dp4_l7), id(dp4_l8), id(dp4_l9), id(dp4_l10), id(dp4_l11)};
+              desk_layout::apply_labels(b, l, 12, id(dp4_labels).state, id(dp4_ents).state);
+              desk_layout::apply_states(b, 12, id(dp4_states).state); }
+  # Light the Spotify / YouTube button that matches the HA source selector
+  - id: sync_source
+    mode: restart
+    then:
+      - lvgl.widget.update:
+          id: src_sp_btn
+          state:
+            checked: !lambda 'return id(pl_source).state == "Spotify";'
+      - lvgl.widget.update:
+          id: src_yt_btn
+          state:
+            checked: !lambda 'return id(pl_source).state == "YouTube Music";'
+  - id: sync_source_later
+    mode: restart
+    then:
+      - delay: 1500ms
+      - script.execute: sync_source
+  - id: sync_dyn_later
+    mode: restart
+    then:
+      - delay: 1500ms
+      - script.execute: sync_dyn
+  # Highlight the active bottom-bar button
+  - id: set_nav
+    parameters:
+      idx: int
+    then:
+      - lambda: |-
+          lv_obj_t *const navs[] = {id(nav_b0), id(nav_b1), id(nav_b2), id(nav_b3), id(nav_b4), id(nav_b5), id(nav_b6), id(nav_b7)};
+          for (int i = 0; i < 8; i++) {
+            if (i == idx) lv_obj_add_state(navs[i], LV_STATE_CHECKED);
+            else lv_obj_remove_state(navs[i], LV_STATE_CHECKED);
+          }
+  - id: ma_action
+    parameters:
+      svc: string
+    then:
+      - homeassistant.action:
+          action: !lambda 'return svc;'
+          data:
+            entity_id: !lambda 'return id(np_player).state;'
+  - id: set_volume
+    parameters:
+      pct: int
+    then:
+      - homeassistant.action:
+          action: media_player.volume_set
+          data:
+            entity_id: !lambda 'return id(np_player).state;'
+            volume_level: !lambda 'return pct / 100.0f;'
+  - id: thermostat_nudge
+    parameters:
+      delta: float
+    then:
+      - homeassistant.action:
+          action: climate.set_temperature
+          data:
+            entity_id: ${thermostat}
+            temperature: !lambda 'return id(th_target).state + delta;'
+  - id: thermostat_mode
+    parameters:
+      mode: string
+    then:
+      - homeassistant.action:
+          action: climate.set_hvac_mode
+          data:
+            entity_id: ${thermostat}
+            hvac_mode: !lambda 'return mode;'
+
+# ───────────── LVGL UI ─────────────
+lvgl:
+  displays: [my_display]
+  touchscreens: [my_touchscreen]
+  buffer_size: 25%
+  on_idle:
+    timeout: !lambda 'return (uint32_t) (id(screen_timeout).state * 60000);'
+    then:
+      - light.turn_off: backlight
+      - lvgl.pause:
+
+  theme:
+    label:
+      text_color: 0xE8E8E8
+    # Off = solid black + outline (dark-grey fills shimmer on this TN panel)
+    button:
+      bg_color: 0x000000
+      radius: 14
+      border_width: 2
+      border_color: 0x4A4D55
+      checked:
+        bg_color: 0x1DB954
+        border_color: 0x1DB954
+    slider:
+      bg_color: 0x3A3D44
+      indicator:
+        bg_color: 0x1DB954
+      knob:
+        bg_color: 0xFFFFFF
+    roller:
+      bg_color: 0x000000
+      border_width: 2
+      border_color: 0x4A4D55
+      text_color: 0xA0A4AB
+      selected:
+        bg_color: 0x1DB954
+        text_color: 0x000000
+
+  style_definitions:
+    - id: page_style
+      bg_color: 0x000000
+      bg_opa: COVER
+      pad_all: 0
+    - id: nav_style
+      bg_color: 0x000000
+      radius: 0
+      border_width: 1
+      border_color: 0x4A4D55
+      border_side: TOP
+    - id: title_style
+      text_font: montserrat_28
+      text_color: 0xFFFFFF
+
+  top_layer:
+    widgets:
+      - obj:
+          id: nav
+          align: BOTTOM_MID
+          width: 800
+          height: 64
+          styles: nav_style
+          pad_all: 0
+          scrollable: false
+          widgets:
+            - button:
+                id: nav_b0
+                x: 0
+                y: 0
+                width: 100
+                height: 64
+                radius: 0
+                border_width: 0
+                on_click:
+                  - lvgl.page.show: dp1
+                  - script.execute: { id: set_nav, idx: 0 }
+                widgets:
+                  - label:
+                      id: navl_0
+                      align: CENTER
+                      width: 94
+                      text_align: CENTER
+                      long_mode: DOT
+                      text_font: montserrat_16
+                      text: "Page 1"
+            - button:
+                id: nav_b1
+                x: 100
+                y: 0
+                width: 100
+                height: 64
+                radius: 0
+                border_width: 0
+                on_click:
+                  - lvgl.page.show: dp2
+                  - script.execute: { id: set_nav, idx: 1 }
+                widgets:
+                  - label:
+                      id: navl_1
+                      align: CENTER
+                      width: 94
+                      text_align: CENTER
+                      long_mode: DOT
+                      text_font: montserrat_16
+                      text: "Page 2"
+            - button:
+                id: nav_b2
+                x: 200
+                y: 0
+                width: 100
+                height: 64
+                radius: 0
+                border_width: 0
+                on_click:
+                  - lvgl.page.show: dp3
+                  - script.execute: { id: set_nav, idx: 2 }
+                widgets:
+                  - label:
+                      id: navl_2
+                      align: CENTER
+                      width: 94
+                      text_align: CENTER
+                      long_mode: DOT
+                      text_font: montserrat_16
+                      text: "Page 3"
+            - button:
+                id: nav_b3
+                x: 300
+                y: 0
+                width: 100
+                height: 64
+                radius: 0
+                border_width: 0
+                on_click:
+                  - lvgl.page.show: dp4
+                  - script.execute: { id: set_nav, idx: 3 }
+                widgets:
+                  - label:
+                      id: navl_3
+                      align: CENTER
+                      width: 94
+                      text_align: CENTER
+                      long_mode: DOT
+                      text_font: montserrat_16
+                      text: "Page 4"
+            - button:
+                id: nav_b4
+                x: 400
+                y: 0
+                width: 100
+                height: 64
+                radius: 0
+                border_width: 0
+                on_click:
+                  - lvgl.page.show: music_page
+                  - script.execute: { id: set_nav, idx: 4 }
+                widgets:
+                  - label:
+                      id: navl_4
+                      align: CENTER
+                      width: 94
+                      text_align: CENTER
+                      long_mode: DOT
+                      text_font: montserrat_16
+                      text: "\uF001 Music"
+            - button:
+                id: nav_b5
+                x: 500
+                y: 0
+                width: 100
+                height: 64
+                radius: 0
+                border_width: 0
+                on_click:
+                  - lvgl.page.show: library_page
+                  - script.execute: { id: set_nav, idx: 5 }
+                widgets:
+                  - label:
+                      id: navl_5
+                      align: CENTER
+                      width: 94
+                      text_align: CENTER
+                      long_mode: DOT
+                      text_font: montserrat_16
+                      text: "\uF00B Library"
+            - button:
+                id: nav_b6
+                x: 600
+                y: 0
+                width: 100
+                height: 64
+                radius: 0
+                border_width: 0
+                on_click:
+                  - lvgl.page.show: speakers_page
+                  - script.execute: { id: set_nav, idx: 6 }
+                widgets:
+                  - label:
+                      id: navl_6
+                      align: CENTER
+                      width: 94
+                      text_align: CENTER
+                      long_mode: DOT
+                      text_font: montserrat_16
+                      text: "\uF028 Speakers"
+            - button:
+                id: nav_b7
+                x: 700
+                y: 0
+                width: 100
+                height: 64
+                radius: 0
+                border_width: 0
+                on_click:
+                  - lvgl.page.show: climate_page
+                  - script.execute: { id: set_nav, idx: 7 }
+                widgets:
+                  - label:
+                      id: navl_7
+                      align: CENTER
+                      width: 94
+                      text_align: CENTER
+                      long_mode: DOT
+                      text_font: montserrat_16
+                      text: "\uF013 Climate"
+
+  pages:
+    # ─── PAGE 1 (layout from the desktop app) ───
+    - id: dp1
+      styles: page_style
+      widgets:
+        - label:
+            id: dp1_title
+            x: 24
+            y: 20
+            styles: title_style
+            text: "Page 1"
+        - label:
+            align: TOP_RIGHT
+            x: -24
+            y: 28
+            text_color: 0x55585F
+            text: "v${version}"
+        - button:
+            id: dp1_b0
+            x: 24
+            y: 70
+            width: 176
+            height: 104
+            checkable: true
+            hidden: true
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !desk_layout::entity_at(id(dp1_ents).state, 0).empty();'
+                  then:
+                    - homeassistant.action:
+                        action: script.desk_panel_tap
+                        data:
+                          entity: !lambda 'return desk_layout::entity_at(id(dp1_ents).state, 0);'
+                    - script.execute: sync_dyn_later
+            widgets:
+              - label:
+                  id: dp1_l0
+                  align: CENTER
+                  width: 164
+                  text_align: CENTER
+                  text_font: montserrat_20
+                  long_mode: DOT
+                  text: ""
+        - button:
+            id: dp1_b1
+            x: 216
+            y: 70
+            width: 176
+            height: 104
+            checkable: true
+            hidden: true
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !desk_layout::entity_at(id(dp1_ents).state, 1).empty();'
+                  then:
+                    - homeassistant.action:
+                        action: script.desk_panel_tap
+                        data:
+                          entity: !lambda 'return desk_layout::entity_at(id(dp1_ents).state, 1);'
+                    - script.execute: sync_dyn_later
+            widgets:
+              - label:
+                  id: dp1_l1
+                  align: CENTER
+                  width: 164
+                  text_align: CENTER
+                  text_font: montserrat_20
+                  long_mode: DOT
+                  text: ""
+        - button:
+            id: dp1_b2
+            x: 408
+            y: 70
+            width: 176
+            height: 104
+            checkable: true
+            hidden: true
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !desk_layout::entity_at(id(dp1_ents).state, 2).empty();'
+                  then:
+                    - homeassistant.action:
+                        action: script.desk_panel_tap
+                        data:
+                          entity: !lambda 'return desk_layout::entity_at(id(dp1_ents).state, 2);'
+                    - script.execute: sync_dyn_later
+            widgets:
+              - label:
+                  id: dp1_l2
+                  align: CENTER
+                  width: 164
+                  text_align: CENTER
+                  text_font: montserrat_20
+                  long_mode: DOT
+                  text: ""
+        - button:
+            id: dp1_b3
+            x: 600
+            y: 70
+            width: 176
+            height: 104
+            checkable: true
+            hidden: true
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !desk_layout::entity_at(id(dp1_ents).state, 3).empty();'
+                  then:
+                    - homeassistant.action:
+                        action: script.desk_panel_tap
+                        data:
+                          entity: !lambda 'return desk_layout::entity_at(id(dp1_ents).state, 3);'
+                    - script.execute: sync_dyn_later
+            widgets:
+              - label:
+                  id: dp1_l3
+                  align: CENTER
+                  width: 164
+                  text_align: CENTER
+                  text_font: montserrat_20
+                  long_mode: DOT
+                  text: ""
+        - button:
+            id: dp1_b4
+            x: 24
+            y: 184
+            width: 176
+            height: 104
+            checkable: true
+            hidden: true
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !desk_layout::entity_at(id(dp1_ents).state, 4).empty();'
+                  then:
+                    - homeassistant.action:
+                        action: script.desk_panel_tap
+                        data:
+                          entity: !lambda 'return desk_layout::entity_at(id(dp1_ents).state, 4);'
+                    - script.execute: sync_dyn_later
+            widgets:
+              - label:
+                  id: dp1_l4
+                  align: CENTER
+                  width: 164
+                  text_align: CENTER
+                  text_font: montserrat_20
+                  long_mode: DOT
+                  text: ""
+        - button:
+            id: dp1_b5
+            x: 216
+            y: 184
+            width: 176
+            height: 104
+            checkable: true
+            hidden: true
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !desk_layout::entity_at(id(dp1_ents).state, 5).empty();'
+                  then:
+                    - homeassistant.action:
+                        action: script.desk_panel_tap
+                        data:
+                          entity: !lambda 'return desk_layout::entity_at(id(dp1_ents).state, 5);'
+                    - script.execute: sync_dyn_later
+            widgets:
+              - label:
+                  id: dp1_l5
+                  align: CENTER
+                  width: 164
+                  text_align: CENTER
+                  text_font: montserrat_20
+                  long_mode: DOT
+                  text: ""
+        - button:
+            id: dp1_b6
+            x: 408
+            y: 184
+            width: 176
+            height: 104
+            checkable: true
+            hidden: true
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !desk_layout::entity_at(id(dp1_ents).state, 6).empty();'
+                  then:
+                    - homeassistant.action:
+                        action: script.desk_panel_tap
+                        data:
+                          entity: !lambda 'return desk_layout::entity_at(id(dp1_ents).state, 6);'
+                    - script.execute: sync_dyn_later
+            widgets:
+              - label:
+                  id: dp1_l6
+                  align: CENTER
+                  width: 164
+                  text_align: CENTER
+                  text_font: montserrat_20
+                  long_mode: DOT
+                  text: ""
+        - button:
+            id: dp1_b7
+            x: 600
+            y: 184
+            width: 176
+            height: 104
+            checkable: true
+            hidden: true
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !desk_layout::entity_at(id(dp1_ents).state, 7).empty();'
+                  then:
+                    - homeassistant.action:
+                        action: script.desk_panel_tap
+                        data:
+                          entity: !lambda 'return desk_layout::entity_at(id(dp1_ents).state, 7);'
+                    - script.execute: sync_dyn_later
+            widgets:
+              - label:
+                  id: dp1_l7
+                  align: CENTER
+                  width: 164
+                  text_align: CENTER
+                  text_font: montserrat_20
+                  long_mode: DOT
+                  text: ""
+        - button:
+            id: dp1_b8
+            x: 24
+            y: 298
+            width: 176
+            height: 104
+            checkable: true
+            hidden: true
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !desk_layout::entity_at(id(dp1_ents).state, 8).empty();'
+                  then:
+                    - homeassistant.action:
+                        action: script.desk_panel_tap
+                        data:
+                          entity: !lambda 'return desk_layout::entity_at(id(dp1_ents).state, 8);'
+                    - script.execute: sync_dyn_later
+            widgets:
+              - label:
+                  id: dp1_l8
+                  align: CENTER
+                  width: 164
+                  text_align: CENTER
+                  text_font: montserrat_20
+                  long_mode: DOT
+                  text: ""
+        - button:
+            id: dp1_b9
+            x: 216
+            y: 298
+            width: 176
+            height: 104
+            checkable: true
+            hidden: true
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !desk_layout::entity_at(id(dp1_ents).state, 9).empty();'
+                  then:
+                    - homeassistant.action:
+                        action: script.desk_panel_tap
+                        data:
+                          entity: !lambda 'return desk_layout::entity_at(id(dp1_ents).state, 9);'
+                    - script.execute: sync_dyn_later
+            widgets:
+              - label:
+                  id: dp1_l9
+                  align: CENTER
+                  width: 164
+                  text_align: CENTER
+                  text_font: montserrat_20
+                  long_mode: DOT
+                  text: ""
+        - button:
+            id: dp1_b10
+            x: 408
+            y: 298
+            width: 176
+            height: 104
+            checkable: true
+            hidden: true
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !desk_layout::entity_at(id(dp1_ents).state, 10).empty();'
+                  then:
+                    - homeassistant.action:
+                        action: script.desk_panel_tap
+                        data:
+                          entity: !lambda 'return desk_layout::entity_at(id(dp1_ents).state, 10);'
+                    - script.execute: sync_dyn_later
+            widgets:
+              - label:
+                  id: dp1_l10
+                  align: CENTER
+                  width: 164
+                  text_align: CENTER
+                  text_font: montserrat_20
+                  long_mode: DOT
+                  text: ""
+        - button:
+            id: dp1_b11
+            x: 600
+            y: 298
+            width: 176
+            height: 104
+            checkable: true
+            hidden: true
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !desk_layout::entity_at(id(dp1_ents).state, 11).empty();'
+                  then:
+                    - homeassistant.action:
+                        action: script.desk_panel_tap
+                        data:
+                          entity: !lambda 'return desk_layout::entity_at(id(dp1_ents).state, 11);'
+                    - script.execute: sync_dyn_later
+            widgets:
+              - label:
+                  id: dp1_l11
+                  align: CENTER
+                  width: 164
+                  text_align: CENTER
+                  text_font: montserrat_20
+                  long_mode: DOT
+                  text: ""
+    # ─── PAGE 2 (layout from the desktop app) ───
+    - id: dp2
+      styles: page_style
+      widgets:
+        - label:
+            id: dp2_title
+            x: 24
+            y: 20
+            styles: title_style
+            text: "Page 2"
+        - button:
+            id: dp2_b0
+            x: 24
+            y: 70
+            width: 176
+            height: 104
+            checkable: true
+            hidden: true
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !desk_layout::entity_at(id(dp2_ents).state, 0).empty();'
+                  then:
+                    - homeassistant.action:
+                        action: script.desk_panel_tap
+                        data:
+                          entity: !lambda 'return desk_layout::entity_at(id(dp2_ents).state, 0);'
+                    - script.execute: sync_dyn_later
+            widgets:
+              - label:
+                  id: dp2_l0
+                  align: CENTER
+                  width: 164
+                  text_align: CENTER
+                  text_font: montserrat_20
+                  long_mode: DOT
+                  text: ""
+        - button:
+            id: dp2_b1
+            x: 216
+            y: 70
+            width: 176
+            height: 104
+            checkable: true
+            hidden: true
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !desk_layout::entity_at(id(dp2_ents).state, 1).empty();'
+                  then:
+                    - homeassistant.action:
+                        action: script.desk_panel_tap
+                        data:
+                          entity: !lambda 'return desk_layout::entity_at(id(dp2_ents).state, 1);'
+                    - script.execute: sync_dyn_later
+            widgets:
+              - label:
+                  id: dp2_l1
+                  align: CENTER
+                  width: 164
+                  text_align: CENTER
+                  text_font: montserrat_20
+                  long_mode: DOT
+                  text: ""
+        - button:
+            id: dp2_b2
+            x: 408
+            y: 70
+            width: 176
+            height: 104
+            checkable: true
+            hidden: true
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !desk_layout::entity_at(id(dp2_ents).state, 2).empty();'
+                  then:
+                    - homeassistant.action:
+                        action: script.desk_panel_tap
+                        data:
+                          entity: !lambda 'return desk_layout::entity_at(id(dp2_ents).state, 2);'
+                    - script.execute: sync_dyn_later
+            widgets:
+              - label:
+                  id: dp2_l2
+                  align: CENTER
+                  width: 164
+                  text_align: CENTER
+                  text_font: montserrat_20
+                  long_mode: DOT
+                  text: ""
+        - button:
+            id: dp2_b3
+            x: 600
+            y: 70
+            width: 176
+            height: 104
+            checkable: true
+            hidden: true
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !desk_layout::entity_at(id(dp2_ents).state, 3).empty();'
+                  then:
+                    - homeassistant.action:
+                        action: script.desk_panel_tap
+                        data:
+                          entity: !lambda 'return desk_layout::entity_at(id(dp2_ents).state, 3);'
+                    - script.execute: sync_dyn_later
+            widgets:
+              - label:
+                  id: dp2_l3
+                  align: CENTER
+                  width: 164
+                  text_align: CENTER
+                  text_font: montserrat_20
+                  long_mode: DOT
+                  text: ""
+        - button:
+            id: dp2_b4
+            x: 24
+            y: 184
+            width: 176
+            height: 104
+            checkable: true
+            hidden: true
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !desk_layout::entity_at(id(dp2_ents).state, 4).empty();'
+                  then:
+                    - homeassistant.action:
+                        action: script.desk_panel_tap
+                        data:
+                          entity: !lambda 'return desk_layout::entity_at(id(dp2_ents).state, 4);'
+                    - script.execute: sync_dyn_later
+            widgets:
+              - label:
+                  id: dp2_l4
+                  align: CENTER
+                  width: 164
+                  text_align: CENTER
+                  text_font: montserrat_20
+                  long_mode: DOT
+                  text: ""
+        - button:
+            id: dp2_b5
+            x: 216
+            y: 184
+            width: 176
+            height: 104
+            checkable: true
+            hidden: true
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !desk_layout::entity_at(id(dp2_ents).state, 5).empty();'
+                  then:
+                    - homeassistant.action:
+                        action: script.desk_panel_tap
+                        data:
+                          entity: !lambda 'return desk_layout::entity_at(id(dp2_ents).state, 5);'
+                    - script.execute: sync_dyn_later
+            widgets:
+              - label:
+                  id: dp2_l5
+                  align: CENTER
+                  width: 164
+                  text_align: CENTER
+                  text_font: montserrat_20
+                  long_mode: DOT
+                  text: ""
+        - button:
+            id: dp2_b6
+            x: 408
+            y: 184
+            width: 176
+            height: 104
+            checkable: true
+            hidden: true
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !desk_layout::entity_at(id(dp2_ents).state, 6).empty();'
+                  then:
+                    - homeassistant.action:
+                        action: script.desk_panel_tap
+                        data:
+                          entity: !lambda 'return desk_layout::entity_at(id(dp2_ents).state, 6);'
+                    - script.execute: sync_dyn_later
+            widgets:
+              - label:
+                  id: dp2_l6
+                  align: CENTER
+                  width: 164
+                  text_align: CENTER
+                  text_font: montserrat_20
+                  long_mode: DOT
+                  text: ""
+        - button:
+            id: dp2_b7
+            x: 600
+            y: 184
+            width: 176
+            height: 104
+            checkable: true
+            hidden: true
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !desk_layout::entity_at(id(dp2_ents).state, 7).empty();'
+                  then:
+                    - homeassistant.action:
+                        action: script.desk_panel_tap
+                        data:
+                          entity: !lambda 'return desk_layout::entity_at(id(dp2_ents).state, 7);'
+                    - script.execute: sync_dyn_later
+            widgets:
+              - label:
+                  id: dp2_l7
+                  align: CENTER
+                  width: 164
+                  text_align: CENTER
+                  text_font: montserrat_20
+                  long_mode: DOT
+                  text: ""
+        - button:
+            id: dp2_b8
+            x: 24
+            y: 298
+            width: 176
+            height: 104
+            checkable: true
+            hidden: true
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !desk_layout::entity_at(id(dp2_ents).state, 8).empty();'
+                  then:
+                    - homeassistant.action:
+                        action: script.desk_panel_tap
+                        data:
+                          entity: !lambda 'return desk_layout::entity_at(id(dp2_ents).state, 8);'
+                    - script.execute: sync_dyn_later
+            widgets:
+              - label:
+                  id: dp2_l8
+                  align: CENTER
+                  width: 164
+                  text_align: CENTER
+                  text_font: montserrat_20
+                  long_mode: DOT
+                  text: ""
+        - button:
+            id: dp2_b9
+            x: 216
+            y: 298
+            width: 176
+            height: 104
+            checkable: true
+            hidden: true
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !desk_layout::entity_at(id(dp2_ents).state, 9).empty();'
+                  then:
+                    - homeassistant.action:
+                        action: script.desk_panel_tap
+                        data:
+                          entity: !lambda 'return desk_layout::entity_at(id(dp2_ents).state, 9);'
+                    - script.execute: sync_dyn_later
+            widgets:
+              - label:
+                  id: dp2_l9
+                  align: CENTER
+                  width: 164
+                  text_align: CENTER
+                  text_font: montserrat_20
+                  long_mode: DOT
+                  text: ""
+        - button:
+            id: dp2_b10
+            x: 408
+            y: 298
+            width: 176
+            height: 104
+            checkable: true
+            hidden: true
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !desk_layout::entity_at(id(dp2_ents).state, 10).empty();'
+                  then:
+                    - homeassistant.action:
+                        action: script.desk_panel_tap
+                        data:
+                          entity: !lambda 'return desk_layout::entity_at(id(dp2_ents).state, 10);'
+                    - script.execute: sync_dyn_later
+            widgets:
+              - label:
+                  id: dp2_l10
+                  align: CENTER
+                  width: 164
+                  text_align: CENTER
+                  text_font: montserrat_20
+                  long_mode: DOT
+                  text: ""
+        - button:
+            id: dp2_b11
+            x: 600
+            y: 298
+            width: 176
+            height: 104
+            checkable: true
+            hidden: true
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !desk_layout::entity_at(id(dp2_ents).state, 11).empty();'
+                  then:
+                    - homeassistant.action:
+                        action: script.desk_panel_tap
+                        data:
+                          entity: !lambda 'return desk_layout::entity_at(id(dp2_ents).state, 11);'
+                    - script.execute: sync_dyn_later
+            widgets:
+              - label:
+                  id: dp2_l11
+                  align: CENTER
+                  width: 164
+                  text_align: CENTER
+                  text_font: montserrat_20
+                  long_mode: DOT
+                  text: ""
+    # ─── PAGE 3 (layout from the desktop app) ───
+    - id: dp3
+      styles: page_style
+      widgets:
+        - label:
+            id: dp3_title
+            x: 24
+            y: 20
+            styles: title_style
+            text: "Page 3"
+        - button:
+            id: dp3_b0
+            x: 24
+            y: 70
+            width: 176
+            height: 104
+            checkable: true
+            hidden: true
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !desk_layout::entity_at(id(dp3_ents).state, 0).empty();'
+                  then:
+                    - homeassistant.action:
+                        action: script.desk_panel_tap
+                        data:
+                          entity: !lambda 'return desk_layout::entity_at(id(dp3_ents).state, 0);'
+                    - script.execute: sync_dyn_later
+            widgets:
+              - label:
+                  id: dp3_l0
+                  align: CENTER
+                  width: 164
+                  text_align: CENTER
+                  text_font: montserrat_20
+                  long_mode: DOT
+                  text: ""
+        - button:
+            id: dp3_b1
+            x: 216
+            y: 70
+            width: 176
+            height: 104
+            checkable: true
+            hidden: true
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !desk_layout::entity_at(id(dp3_ents).state, 1).empty();'
+                  then:
+                    - homeassistant.action:
+                        action: script.desk_panel_tap
+                        data:
+                          entity: !lambda 'return desk_layout::entity_at(id(dp3_ents).state, 1);'
+                    - script.execute: sync_dyn_later
+            widgets:
+              - label:
+                  id: dp3_l1
+                  align: CENTER
+                  width: 164
+                  text_align: CENTER
+                  text_font: montserrat_20
+                  long_mode: DOT
+                  text: ""
+        - button:
+            id: dp3_b2
+            x: 408
+            y: 70
+            width: 176
+            height: 104
+            checkable: true
+            hidden: true
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !desk_layout::entity_at(id(dp3_ents).state, 2).empty();'
+                  then:
+                    - homeassistant.action:
+                        action: script.desk_panel_tap
+                        data:
+                          entity: !lambda 'return desk_layout::entity_at(id(dp3_ents).state, 2);'
+                    - script.execute: sync_dyn_later
+            widgets:
+              - label:
+                  id: dp3_l2
+                  align: CENTER
+                  width: 164
+                  text_align: CENTER
+                  text_font: montserrat_20
+                  long_mode: DOT
+                  text: ""
+        - button:
+            id: dp3_b3
+            x: 600
+            y: 70
+            width: 176
+            height: 104
+            checkable: true
+            hidden: true
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !desk_layout::entity_at(id(dp3_ents).state, 3).empty();'
+                  then:
+                    - homeassistant.action:
+                        action: script.desk_panel_tap
+                        data:
+                          entity: !lambda 'return desk_layout::entity_at(id(dp3_ents).state, 3);'
+                    - script.execute: sync_dyn_later
+            widgets:
+              - label:
+                  id: dp3_l3
+                  align: CENTER
+                  width: 164
+                  text_align: CENTER
+                  text_font: montserrat_20
+                  long_mode: DOT
+                  text: ""
+        - button:
+            id: dp3_b4
+            x: 24
+            y: 184
+            width: 176
+            height: 104
+            checkable: true
+            hidden: true
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !desk_layout::entity_at(id(dp3_ents).state, 4).empty();'
+                  then:
+                    - homeassistant.action:
+                        action: script.desk_panel_tap
+                        data:
+                          entity: !lambda 'return desk_layout::entity_at(id(dp3_ents).state, 4);'
+                    - script.execute: sync_dyn_later
+            widgets:
+              - label:
+                  id: dp3_l4
+                  align: CENTER
+                  width: 164
+                  text_align: CENTER
+                  text_font: montserrat_20
+                  long_mode: DOT
+                  text: ""
+        - button:
+            id: dp3_b5
+            x: 216
+            y: 184
+            width: 176
+            height: 104
+            checkable: true
+            hidden: true
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !desk_layout::entity_at(id(dp3_ents).state, 5).empty();'
+                  then:
+                    - homeassistant.action:
+                        action: script.desk_panel_tap
+                        data:
+                          entity: !lambda 'return desk_layout::entity_at(id(dp3_ents).state, 5);'
+                    - script.execute: sync_dyn_later
+            widgets:
+              - label:
+                  id: dp3_l5
+                  align: CENTER
+                  width: 164
+                  text_align: CENTER
+                  text_font: montserrat_20
+                  long_mode: DOT
+                  text: ""
+        - button:
+            id: dp3_b6
+            x: 408
+            y: 184
+            width: 176
+            height: 104
+            checkable: true
+            hidden: true
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !desk_layout::entity_at(id(dp3_ents).state, 6).empty();'
+                  then:
+                    - homeassistant.action:
+                        action: script.desk_panel_tap
+                        data:
+                          entity: !lambda 'return desk_layout::entity_at(id(dp3_ents).state, 6);'
+                    - script.execute: sync_dyn_later
+            widgets:
+              - label:
+                  id: dp3_l6
+                  align: CENTER
+                  width: 164
+                  text_align: CENTER
+                  text_font: montserrat_20
+                  long_mode: DOT
+                  text: ""
+        - button:
+            id: dp3_b7
+            x: 600
+            y: 184
+            width: 176
+            height: 104
+            checkable: true
+            hidden: true
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !desk_layout::entity_at(id(dp3_ents).state, 7).empty();'
+                  then:
+                    - homeassistant.action:
+                        action: script.desk_panel_tap
+                        data:
+                          entity: !lambda 'return desk_layout::entity_at(id(dp3_ents).state, 7);'
+                    - script.execute: sync_dyn_later
+            widgets:
+              - label:
+                  id: dp3_l7
+                  align: CENTER
+                  width: 164
+                  text_align: CENTER
+                  text_font: montserrat_20
+                  long_mode: DOT
+                  text: ""
+        - button:
+            id: dp3_b8
+            x: 24
+            y: 298
+            width: 176
+            height: 104
+            checkable: true
+            hidden: true
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !desk_layout::entity_at(id(dp3_ents).state, 8).empty();'
+                  then:
+                    - homeassistant.action:
+                        action: script.desk_panel_tap
+                        data:
+                          entity: !lambda 'return desk_layout::entity_at(id(dp3_ents).state, 8);'
+                    - script.execute: sync_dyn_later
+            widgets:
+              - label:
+                  id: dp3_l8
+                  align: CENTER
+                  width: 164
+                  text_align: CENTER
+                  text_font: montserrat_20
+                  long_mode: DOT
+                  text: ""
+        - button:
+            id: dp3_b9
+            x: 216
+            y: 298
+            width: 176
+            height: 104
+            checkable: true
+            hidden: true
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !desk_layout::entity_at(id(dp3_ents).state, 9).empty();'
+                  then:
+                    - homeassistant.action:
+                        action: script.desk_panel_tap
+                        data:
+                          entity: !lambda 'return desk_layout::entity_at(id(dp3_ents).state, 9);'
+                    - script.execute: sync_dyn_later
+            widgets:
+              - label:
+                  id: dp3_l9
+                  align: CENTER
+                  width: 164
+                  text_align: CENTER
+                  text_font: montserrat_20
+                  long_mode: DOT
+                  text: ""
+        - button:
+            id: dp3_b10
+            x: 408
+            y: 298
+            width: 176
+            height: 104
+            checkable: true
+            hidden: true
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !desk_layout::entity_at(id(dp3_ents).state, 10).empty();'
+                  then:
+                    - homeassistant.action:
+                        action: script.desk_panel_tap
+                        data:
+                          entity: !lambda 'return desk_layout::entity_at(id(dp3_ents).state, 10);'
+                    - script.execute: sync_dyn_later
+            widgets:
+              - label:
+                  id: dp3_l10
+                  align: CENTER
+                  width: 164
+                  text_align: CENTER
+                  text_font: montserrat_20
+                  long_mode: DOT
+                  text: ""
+        - button:
+            id: dp3_b11
+            x: 600
+            y: 298
+            width: 176
+            height: 104
+            checkable: true
+            hidden: true
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !desk_layout::entity_at(id(dp3_ents).state, 11).empty();'
+                  then:
+                    - homeassistant.action:
+                        action: script.desk_panel_tap
+                        data:
+                          entity: !lambda 'return desk_layout::entity_at(id(dp3_ents).state, 11);'
+                    - script.execute: sync_dyn_later
+            widgets:
+              - label:
+                  id: dp3_l11
+                  align: CENTER
+                  width: 164
+                  text_align: CENTER
+                  text_font: montserrat_20
+                  long_mode: DOT
+                  text: ""
+    # ─── PAGE 4 (layout from the desktop app) ───
+    - id: dp4
+      styles: page_style
+      widgets:
+        - label:
+            id: dp4_title
+            x: 24
+            y: 20
+            styles: title_style
+            text: "Page 4"
+        - button:
+            id: dp4_b0
+            x: 24
+            y: 70
+            width: 176
+            height: 104
+            checkable: true
+            hidden: true
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !desk_layout::entity_at(id(dp4_ents).state, 0).empty();'
+                  then:
+                    - homeassistant.action:
+                        action: script.desk_panel_tap
+                        data:
+                          entity: !lambda 'return desk_layout::entity_at(id(dp4_ents).state, 0);'
+                    - script.execute: sync_dyn_later
+            widgets:
+              - label:
+                  id: dp4_l0
+                  align: CENTER
+                  width: 164
+                  text_align: CENTER
+                  text_font: montserrat_20
+                  long_mode: DOT
+                  text: ""
+        - button:
+            id: dp4_b1
+            x: 216
+            y: 70
+            width: 176
+            height: 104
+            checkable: true
+            hidden: true
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !desk_layout::entity_at(id(dp4_ents).state, 1).empty();'
+                  then:
+                    - homeassistant.action:
+                        action: script.desk_panel_tap
+                        data:
+                          entity: !lambda 'return desk_layout::entity_at(id(dp4_ents).state, 1);'
+                    - script.execute: sync_dyn_later
+            widgets:
+              - label:
+                  id: dp4_l1
+                  align: CENTER
+                  width: 164
+                  text_align: CENTER
+                  text_font: montserrat_20
+                  long_mode: DOT
+                  text: ""
+        - button:
+            id: dp4_b2
+            x: 408
+            y: 70
+            width: 176
+            height: 104
+            checkable: true
+            hidden: true
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !desk_layout::entity_at(id(dp4_ents).state, 2).empty();'
+                  then:
+                    - homeassistant.action:
+                        action: script.desk_panel_tap
+                        data:
+                          entity: !lambda 'return desk_layout::entity_at(id(dp4_ents).state, 2);'
+                    - script.execute: sync_dyn_later
+            widgets:
+              - label:
+                  id: dp4_l2
+                  align: CENTER
+                  width: 164
+                  text_align: CENTER
+                  text_font: montserrat_20
+                  long_mode: DOT
+                  text: ""
+        - button:
+            id: dp4_b3
+            x: 600
+            y: 70
+            width: 176
+            height: 104
+            checkable: true
+            hidden: true
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !desk_layout::entity_at(id(dp4_ents).state, 3).empty();'
+                  then:
+                    - homeassistant.action:
+                        action: script.desk_panel_tap
+                        data:
+                          entity: !lambda 'return desk_layout::entity_at(id(dp4_ents).state, 3);'
+                    - script.execute: sync_dyn_later
+            widgets:
+              - label:
+                  id: dp4_l3
+                  align: CENTER
+                  width: 164
+                  text_align: CENTER
+                  text_font: montserrat_20
+                  long_mode: DOT
+                  text: ""
+        - button:
+            id: dp4_b4
+            x: 24
+            y: 184
+            width: 176
+            height: 104
+            checkable: true
+            hidden: true
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !desk_layout::entity_at(id(dp4_ents).state, 4).empty();'
+                  then:
+                    - homeassistant.action:
+                        action: script.desk_panel_tap
+                        data:
+                          entity: !lambda 'return desk_layout::entity_at(id(dp4_ents).state, 4);'
+                    - script.execute: sync_dyn_later
+            widgets:
+              - label:
+                  id: dp4_l4
+                  align: CENTER
+                  width: 164
+                  text_align: CENTER
+                  text_font: montserrat_20
+                  long_mode: DOT
+                  text: ""
+        - button:
+            id: dp4_b5
+            x: 216
+            y: 184
+            width: 176
+            height: 104
+            checkable: true
+            hidden: true
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !desk_layout::entity_at(id(dp4_ents).state, 5).empty();'
+                  then:
+                    - homeassistant.action:
+                        action: script.desk_panel_tap
+                        data:
+                          entity: !lambda 'return desk_layout::entity_at(id(dp4_ents).state, 5);'
+                    - script.execute: sync_dyn_later
+            widgets:
+              - label:
+                  id: dp4_l5
+                  align: CENTER
+                  width: 164
+                  text_align: CENTER
+                  text_font: montserrat_20
+                  long_mode: DOT
+                  text: ""
+        - button:
+            id: dp4_b6
+            x: 408
+            y: 184
+            width: 176
+            height: 104
+            checkable: true
+            hidden: true
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !desk_layout::entity_at(id(dp4_ents).state, 6).empty();'
+                  then:
+                    - homeassistant.action:
+                        action: script.desk_panel_tap
+                        data:
+                          entity: !lambda 'return desk_layout::entity_at(id(dp4_ents).state, 6);'
+                    - script.execute: sync_dyn_later
+            widgets:
+              - label:
+                  id: dp4_l6
+                  align: CENTER
+                  width: 164
+                  text_align: CENTER
+                  text_font: montserrat_20
+                  long_mode: DOT
+                  text: ""
+        - button:
+            id: dp4_b7
+            x: 600
+            y: 184
+            width: 176
+            height: 104
+            checkable: true
+            hidden: true
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !desk_layout::entity_at(id(dp4_ents).state, 7).empty();'
+                  then:
+                    - homeassistant.action:
+                        action: script.desk_panel_tap
+                        data:
+                          entity: !lambda 'return desk_layout::entity_at(id(dp4_ents).state, 7);'
+                    - script.execute: sync_dyn_later
+            widgets:
+              - label:
+                  id: dp4_l7
+                  align: CENTER
+                  width: 164
+                  text_align: CENTER
+                  text_font: montserrat_20
+                  long_mode: DOT
+                  text: ""
+        - button:
+            id: dp4_b8
+            x: 24
+            y: 298
+            width: 176
+            height: 104
+            checkable: true
+            hidden: true
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !desk_layout::entity_at(id(dp4_ents).state, 8).empty();'
+                  then:
+                    - homeassistant.action:
+                        action: script.desk_panel_tap
+                        data:
+                          entity: !lambda 'return desk_layout::entity_at(id(dp4_ents).state, 8);'
+                    - script.execute: sync_dyn_later
+            widgets:
+              - label:
+                  id: dp4_l8
+                  align: CENTER
+                  width: 164
+                  text_align: CENTER
+                  text_font: montserrat_20
+                  long_mode: DOT
+                  text: ""
+        - button:
+            id: dp4_b9
+            x: 216
+            y: 298
+            width: 176
+            height: 104
+            checkable: true
+            hidden: true
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !desk_layout::entity_at(id(dp4_ents).state, 9).empty();'
+                  then:
+                    - homeassistant.action:
+                        action: script.desk_panel_tap
+                        data:
+                          entity: !lambda 'return desk_layout::entity_at(id(dp4_ents).state, 9);'
+                    - script.execute: sync_dyn_later
+            widgets:
+              - label:
+                  id: dp4_l9
+                  align: CENTER
+                  width: 164
+                  text_align: CENTER
+                  text_font: montserrat_20
+                  long_mode: DOT
+                  text: ""
+        - button:
+            id: dp4_b10
+            x: 408
+            y: 298
+            width: 176
+            height: 104
+            checkable: true
+            hidden: true
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !desk_layout::entity_at(id(dp4_ents).state, 10).empty();'
+                  then:
+                    - homeassistant.action:
+                        action: script.desk_panel_tap
+                        data:
+                          entity: !lambda 'return desk_layout::entity_at(id(dp4_ents).state, 10);'
+                    - script.execute: sync_dyn_later
+            widgets:
+              - label:
+                  id: dp4_l10
+                  align: CENTER
+                  width: 164
+                  text_align: CENTER
+                  text_font: montserrat_20
+                  long_mode: DOT
+                  text: ""
+        - button:
+            id: dp4_b11
+            x: 600
+            y: 298
+            width: 176
+            height: 104
+            checkable: true
+            hidden: true
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !desk_layout::entity_at(id(dp4_ents).state, 11).empty();'
+                  then:
+                    - homeassistant.action:
+                        action: script.desk_panel_tap
+                        data:
+                          entity: !lambda 'return desk_layout::entity_at(id(dp4_ents).state, 11);'
+                    - script.execute: sync_dyn_later
+            widgets:
+              - label:
+                  id: dp4_l11
+                  align: CENTER
+                  width: 164
+                  text_align: CENTER
+                  text_font: montserrat_20
+                  long_mode: DOT
+                  text: ""
+    # ─── MUSIC ───
+    - id: music_page
+      styles: page_style
+      widgets:
+        - obj:
+            x: 24
+            y: 24
+            width: 260
+            height: 260
+            radius: 16
+            bg_color: 0x000000
+            border_width: 2
+            border_color: 0x4A4D55
+            pad_all: 0
+            clip_corner: true
+            widgets:
+              - label:
+                  align: CENTER
+                  text_font: montserrat_48
+                  text: ""
+                  text_color: 0x55585F
+              - image:
+                  id: art_img
+                  align: CENTER
+                  src: album_art
+                  hidden: true
+        # Speaker picker (order must match input_select.desk_panel_player)
+        - dropdown:
+            id: player_dd
+            x: 304
+            y: 20
+            width: 260
+            text_font: montserrat_16
+            symbol: "\uF078"
+            options: ["${speaker_1_name}", "${speaker_2_name}", "${speaker_3_name}", "${speaker_4_name}"]
+            selected_index: 0
+            dropdown_list:
+              text_font: montserrat_20
+              bg_color: 0x000000
+              border_color: 0x4A4D55
+              border_width: 2
+              text_color: 0xE8E8E8
+              selected:
+                checked:
+                  bg_color: 0x1DB954
+                  text_color: 0x000000
+            on_change:
+              - homeassistant.action:
+                  action: input_select.select_option
+                  data:
+                    entity_id: input_select.desk_panel_player
+                    option: !lambda |-
+                      static const char *const ents[] = {"${speaker_1}", "${speaker_2}", "${speaker_3}", "${speaker_4}"};
+                      return std::string(ents[x < 4 ? x : 0]);
+        # Music source: Spotify / YouTube Music
+        - button:
+            id: src_sp_btn
+            x: 576
+            y: 20
+            width: 96
+            height: 44
+            checkable: true
+            on_click:
+              - homeassistant.action:
+                  action: input_select.select_option
+                  data:
+                    entity_id: input_select.desk_panel_source
+                    option: Spotify
+              - script.execute: sync_source_later
+            widgets:
+              - label: { align: CENTER, text: "Spotify", text_font: montserrat_16 }
+        - button:
+            id: src_yt_btn
+            x: 680
+            y: 20
+            width: 96
+            height: 44
+            checkable: true
+            on_click:
+              - homeassistant.action:
+                  action: input_select.select_option
+                  data:
+                    entity_id: input_select.desk_panel_source
+                    option: YouTube Music
+              - script.execute: sync_source_later
+            widgets:
+              - label: { align: CENTER, text: "YouTube", text_font: montserrat_16 }
+        - label:
+            id: title_lbl
+            x: 304
+            y: 82
+            width: 472
+            text_font: montserrat_28
+            long_mode: SCROLL_CIRCULAR
+            text: "Nothing playing"
+        - label:
+            id: artist_lbl
+            x: 304
+            y: 120
+            width: 472
+            text_font: montserrat_20
+            text_color: 0xA0A4AB
+            long_mode: DOT
+            text: ""
+        # progress + seek
+        - slider:
+            id: prog_slider
+            x: 304
+            y: 162
+            width: 472
+            height: 10
+            min_value: 0
+            max_value: 1000
+            on_press:
+              - lambda: 'id(seeking) = true;'
+            on_release:
+              - if:
+                  condition:
+                    lambda: 'return id(np_dur) > 0;'
+                  then:
+                    - homeassistant.action:
+                        action: media_player.media_seek
+                        data:
+                          entity_id: !lambda 'return id(np_player).state;'
+                          seek_position: !lambda 'return x * id(np_dur) / 1000.0f;'
+              - lambda: 'id(seeking) = false;'
+        - label:
+            id: elapsed_lbl
+            x: 304
+            y: 180
+            text_font: montserrat_14
+            text_color: 0xA0A4AB
+            text: "0:00"
+        - label:
+            id: remain_lbl
+            x: 720
+            y: 180
+            text_font: montserrat_14
+            text_color: 0xA0A4AB
+            text: "--:--"
+        # transport
+        - button:
+            id: shuffle_btn
+            x: 304
+            y: 210
+            width: 72
+            height: 64
+            checkable: true
+            on_click:
+              - homeassistant.action:
+                  action: media_player.shuffle_set
+                  data:
+                    entity_id: !lambda 'return id(np_player).state;'
+                    shuffle: !lambda 'return id(np_shuffle).state != "True";'
+            widgets:
+              - label: { align: CENTER, text: "", text_font: montserrat_24 }
+        - button:
+            x: 386
+            y: 210
+            width: 84
+            height: 64
+            on_click:
+              - script.execute: { id: ma_action, svc: media_player.media_previous_track }
+            widgets:
+              - label: { align: CENTER, text: "", text_font: montserrat_28 }
+        - button:
+            x: 480
+            y: 202
+            width: 100
+            height: 80
+            bg_color: 0x1DB954
+            border_width: 0
+            on_click:
+              # HA script: play/pause if something is queued, otherwise start
+              # music (the player's queue is empty after a restart).
+              - homeassistant.action:
+                  action: script.desk_panel_play_pause
+            widgets:
+              - label: { id: play_icon, align: CENTER, text: "", text_font: montserrat_40, text_color: 0x000000 }
+        - button:
+            x: 590
+            y: 210
+            width: 84
+            height: 64
+            on_click:
+              - script.execute: { id: ma_action, svc: media_player.media_next_track }
+            widgets:
+              - label: { align: CENTER, text: "", text_font: montserrat_28 }
+        - button:
+            id: repeat_btn
+            x: 684
+            y: 210
+            width: 92
+            height: 64
+            checkable: true
+            on_click:
+              - homeassistant.action:
+                  action: media_player.repeat_set
+                  data:
+                    entity_id: !lambda 'return id(np_player).state;'
+                    repeat: !lambda |-
+                      std::string r = id(np_repeat).state;
+                      return std::string(r == "off" ? "all" : (r == "all" ? "one" : "off"));
+            widgets:
+              - label: { id: repeat_lbl, align: CENTER, text: "", text_font: montserrat_24 }
+        # volume
+        - label:
+            x: 304
+            y: 300
+            text: ""
+            text_font: montserrat_24
+        - slider:
+            id: vol_slider
+            x: 346
+            y: 304
+            width: 352
+            height: 16
+            min_value: 0
+            max_value: 100
+            on_release:
+              - script.execute:
+                  id: set_volume
+                  pct: !lambda 'return (int) x;'
+        - label:
+            id: vol_lbl
+            x: 716
+            y: 300
+            text: "--%"
+            text_font: montserrat_20
+        # radio
+        - button:
+            x: 24
+            y: 340
+            width: 368
+            height: 62
+            on_click:
+              - homeassistant.action:
+                  action: script.desk_panel_radio
+                  data:
+                    mode: track
+            widgets:
+              - label: { align: CENTER, text: "  Track radio (more like this)" }
+        - button:
+            x: 408
+            y: 340
+            width: 368
+            height: 62
+            on_click:
+              - homeassistant.action:
+                  action: script.desk_panel_radio
+                  data:
+                    mode: artist
+            widgets:
+              - label: { align: CENTER, text: "  Artist radio" }
+
+    # ─── LIBRARY ───
+    - id: library_page
+      styles: page_style
+      widgets:
+        - label:
+            x: 24
+            y: 24
+            styles: title_style
+            text: "Playlists"
+        - button:
+            x: 300
+            y: 18
+            width: 300
+            height: 48
+            on_click:
+              - homeassistant.action:
+                  action: input_select.select_next
+                  data:
+                    entity_id: input_select.desk_panel_source
+            widgets:
+              - label:
+                  id: src_lbl
+                  align: CENTER
+                  text: "Source: -"
+        - button:
+            x: 616
+            y: 18
+            width: 160
+            height: 48
+            on_click:
+              - homeassistant.event:
+                  event: esphome.desk_panel_refresh_playlists
+            widgets:
+              - label: { align: CENTER, text: " Refresh" }
+        - roller:
+            id: pl_roller
+            x: 24
+            y: 84
+            width: 560
+            height: 320
+            visible_row_count: 7
+            text_font: montserrat_20
+            options:
+              - "Loading playlists..."
+        - button:
+            x: 600
+            y: 84
+            width: 176
+            height: 150
+            bg_color: 0x1DB954
+            border_width: 0
+            on_click:
+              - homeassistant.action:
+                  action: script.desk_panel_play_playlist
+                  data:
+                    index: !lambda 'return (int) id(pl_roller)->get_selected_index();'
+                    shuffle: "false"
+            widgets:
+              - label: { align: CENTER, text: "\nPlay", text_align: CENTER, text_font: montserrat_28, text_color: 0x000000 }
+        - button:
+            x: 600
+            y: 252
+            width: 176
+            height: 150
+            on_click:
+              - homeassistant.action:
+                  action: script.desk_panel_play_playlist
+                  data:
+                    index: !lambda 'return (int) id(pl_roller)->get_selected_index();'
+                    shuffle: "true"
+            widgets:
+              - label: { align: CENTER, text: "\nShuffle", text_align: CENTER, text_font: montserrat_28 }
+
+    # ─── SPEAKERS ───
+    - id: speakers_page
+      styles: page_style
+      widgets:
+        - label:
+            x: 24
+            y: 24
+            styles: title_style
+            text: "Speakers"
+        - label:
+            id: spk_main_lbl
+            x: 200
+            y: 34
+            text_color: 0xA0A4AB
+            text: "Main speaker: -"
+        - button:
+            id: grp_sp1
+            x: 24
+            y: 84
+            width: 300
+            height: 90
+            checkable: true
+            on_click:
+              - homeassistant.action:
+                  action: script.desk_panel_toggle_speaker
+                  data:
+                    speaker: ${speaker_1}
+            widgets:
+              - label:
+                  align: LEFT_MID
+                  text_font: montserrat_20
+                  text: "\uF028  ${speaker_1_name}"
+        - slider:
+            id: sl_sp1
+            x: 360
+            y: 120
+            width: 400
+            height: 18
+            min_value: 0
+            max_value: 100
+            on_release:
+              - homeassistant.action:
+                  action: media_player.volume_set
+                  data:
+                    entity_id: ${speaker_1}
+                    volume_level: !lambda 'return x / 100.0f;'
+        - button:
+            id: grp_sp2
+            x: 24
+            y: 194
+            width: 300
+            height: 90
+            checkable: true
+            on_click:
+              - homeassistant.action:
+                  action: script.desk_panel_toggle_speaker
+                  data:
+                    speaker: ${speaker_2}
+            widgets:
+              - label:
+                  align: LEFT_MID
+                  text_font: montserrat_20
+                  text: "\uF028  ${speaker_2_name}"
+        - slider:
+            id: sl_sp2
+            x: 360
+            y: 230
+            width: 400
+            height: 18
+            min_value: 0
+            max_value: 100
+            on_release:
+              - homeassistant.action:
+                  action: media_player.volume_set
+                  data:
+                    entity_id: ${speaker_2}
+                    volume_level: !lambda 'return x / 100.0f;'
+        - button:
+            id: grp_sp3
+            x: 24
+            y: 304
+            width: 300
+            height: 90
+            checkable: true
+            on_click:
+              - homeassistant.action:
+                  action: script.desk_panel_toggle_speaker
+                  data:
+                    speaker: ${speaker_4}
+            widgets:
+              - label:
+                  align: LEFT_MID
+                  text_font: montserrat_20
+                  text: "\uF028  ${speaker_4_name}"
+        - slider:
+            id: sl_sp3
+            x: 360
+            y: 340
+            width: 400
+            height: 18
+            min_value: 0
+            max_value: 100
+            on_release:
+              - homeassistant.action:
+                  action: media_player.volume_set
+                  data:
+                    entity_id: ${speaker_4}
+                    volume_level: !lambda 'return x / 100.0f;'
+
+    # ─── CLIMATE ───
+    - id: climate_page
+      styles: page_style
+      widgets:
+        - label:
+            x: 24
+            y: 24
+            styles: title_style
+            text: "Climate"
+        - label:
+            id: th_mode_lbl
+            x: 24
+            y: 72
+            text_color: 0xA0A4AB
+            text: "Thermostat not connected yet"
+        - label:
+            id: th_current_lbl
+            x: 60
+            y: 120
+            text_font: montserrat_48
+            text: "--.-°"
+        - label:
+            x: 60
+            y: 180
+            text_color: 0xA0A4AB
+            text: "Inside now"
+        - label:
+            id: th_action_lbl
+            x: 60
+            y: 210
+            text_color: 0xA0A4AB
+            text: ""
+        - button:
+            x: 340
+            y: 110
+            width: 110
+            height: 110
+            on_click:
+              - script.execute: { id: thermostat_nudge, delta: !lambda 'return -${temp_step};' }
+            widgets:
+              - label: { align: CENTER, text: "", text_font: montserrat_40 }
+        - label:
+            id: th_target_lbl
+            x: 470
+            y: 148
+            text_font: montserrat_28
+            text: "Set --.-°"
+        - button:
+            x: 650
+            y: 110
+            width: 110
+            height: 110
+            on_click:
+              - script.execute: { id: thermostat_nudge, delta: !lambda 'return ${temp_step};' }
+            widgets:
+              - label: { align: CENTER, text: "", text_font: montserrat_40 }
+        - button:
+            id: th_heat
+            x: 24
+            y: 260
+            width: 176
+            height: 120
+            checkable: true
+            on_click:
+              - script.execute: { id: thermostat_mode, mode: "heat" }
+            widgets:
+              - label: { align: CENTER, text: "Heat", text_font: montserrat_24 }
+        - button:
+            id: th_cool
+            x: 216
+            y: 260
+            width: 176
+            height: 120
+            checkable: true
+            on_click:
+              - script.execute: { id: thermostat_mode, mode: "cool" }
+            widgets:
+              - label: { align: CENTER, text: "Cool", text_font: montserrat_24 }
+        - button:
+            id: th_auto
+            x: 408
+            y: 260
+            width: 176
+            height: 120
+            checkable: true
+            on_click:
+              - script.execute: { id: thermostat_mode, mode: "heat_cool" }
+            widgets:
+              - label: { align: CENTER, text: "Auto", text_font: montserrat_24 }
+        - button:
+            id: th_off
+            x: 600
+            y: 260
+            width: 176
+            height: 120
+            checkable: true
+            on_click:
+              - script.execute: { id: thermostat_mode, mode: "off" }
+            widgets:
+              - label: { align: CENTER, text: " Off", text_font: montserrat_24 }
+
+# ───────────── OPTIONAL: EC11 volume knob (KY-040) ─────────────
+# Wiring: CLK -> IO44, DT -> IO43 (UART header), SW -> IO38 (GPIO_D), + -> 3V3, GND.
+# To use: set `logger: baud_rate: 0`, remove the GPIO38 lines from the first on_boot
+# lambda, and uncomment below (merge into the existing sensor:/binary_sensor: lists).
+#
+# sensor:
+#   - platform: rotary_encoder
+#     id: vol_knob
+#     pin_a: { number: 44, mode: { input: true, pullup: true } }
+#     pin_b: { number: 43, mode: { input: true, pullup: true } }
+#     resolution: 1
+#     filters: [ debounce: 5ms ]
+#     on_clockwise:
+#       - script.execute: { id: set_volume, pct: !lambda 'return std::min(100, (int) id(np_volume).state + 3);' }
+#     on_anticlockwise:
+#       - script.execute: { id: set_volume, pct: !lambda 'return std::max(0, (int) id(np_volume).state - 3);' }
+# binary_sensor:
+#   - platform: gpio
+#     id: knob_press
+#     pin: { number: 38, mode: { input: true, pullup: true }, inverted: true }
+#     filters: [ delayed_on: 20ms ]
+#     on_click:
+#       - script.execute: { id: ma_action, svc: media_player.media_play_pause }
