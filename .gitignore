@@ -1,0 +1,22 @@
+# secrets
+secrets.yaml
+!secrets.example.yaml
+
+# ESPHome build output
+.esphome/
+firmware/.esphome/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+build/
+dist/
+*.spec
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
