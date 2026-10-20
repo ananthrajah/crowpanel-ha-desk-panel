@@ -1,10 +1,33 @@
 # ═════════════════════════════════════════════════════════════════════════════
 # Desk Panel - Elecrow CrowPanel 7" Basic V3.0 (DIS08070H, ESP32-S3 N4R8)
-# VERSION: 3.0.1   (2026-10-18)
+# VERSION: 3.2.0   (2026-10-20)
 # Pairs with HA package: desk_panel.yaml v3.0.0 or newer  ·  desktop app v0.2.0+
 # Built & compile-tested against ESPHome 2026.9.1
 #
 # CHANGELOG
+#   3.2.0  2026-10-20  Home page: clock + date, temperature, now-playing strip (tap for
+#                      Music), up to 8 favourite buttons and shortcuts to every page.
+#                      Bottom bar gets a Home button (hidden on the home page). Any page
+#                      except Music returns to home after N seconds without a touch
+#                      (set in the desktop app; 0 = never). Sleep also returns home.
+#                      Needs HA package 3.1.0 and desktop app 0.3.0 for favourites,
+#                      timeout and temperature (defaults: none, 30 s, hidden).
+#   3.1.2  2026-10-19  Touch start-up: checks the touch chip actually answers after the
+#                      reset and retries the reset up to 3 times (longer waits). Logs what
+#                      it finds on the touch bus (visible in HA's log) so a loose touch
+#                      ribbon can be told apart from a software problem.
+#                      Bottom bar: page buttons with no page set up in the desktop app
+#                      are now blank and can't be tapped (were "Page 3" / "Page 4").
+#   3.1.1  2026-10-19  Fix: album-art downloads froze the panel (touch + HA updates) for up
+#                      to 20 s. Art is now fetched only when the picture really changes
+#                      (not on every reconnect), never while the screen is asleep (it
+#                      catches up on wake), and HTTP gives up after 5 s instead of 10 s.
+#   3.1.0  2026-10-18  Volume knob (KY-040 on the UART port: CLK->IO44, DT->IO43, +->3V3,
+#                      GND). Turn = volume +/-2 % per click (sent 150 ms after you stop,
+#                      so fast turns don't flood HA); turning also wakes the screen.
+#                      USB serial logging is off (those pins are the knob now) - use
+#                      Wi-Fi logs. Unplug the knob before flashing over USB; OTA is fine.
+#                      Knob press (SW->IO38 on GPIO_D) is ready below, commented out.
 #   3.0.1  2026-10-18  "Panel config version" now shows in HA (was "unknown").
 #                      Speakers are set once in substitutions (speaker_1..4).
 #   3.0.0  2026-10-17  Pages 1-4 are now laid out from the Desk Panel desktop app (via
@@ -49,7 +72,7 @@
 # ═════════════════════════════════════════════════════════════════════════════
 
 substitutions:
-  version: "3.0.1"
+  version: "3.2.0"
   name: crowpanel-desk
   friendly_name: Desk Panel
   now_playing: sensor.desk_panel_now_playing
@@ -100,25 +123,41 @@ esphome:
     # Start on page 1 with its bottom-bar button highlighted
     - priority: -100
       then:
-        - script.execute: { id: set_nav, idx: 0 }
+        - script.execute: { id: set_nav, idx: 8 }
+        - script.execute: clock_update
         - text_sensor.template.publish: { id: cfg_version, state: "${version}" }
     # Elecrow V3.0 touch reset via PCA9557 (0x18): IO0 = GT911 RST, IO1 = GT911 INT.
     # Priority 800 = after the I2C bus, before the touchscreen (600).
     - priority: 800
       then:
         - lambda: |-
+            // Elecrow V3.0: GT911 RST = PCA9557 IO0, INT = IO1. INT low during reset -> 0x5D.
             auto *bus = id(touch_i2c);
             const uint8_t out_low[2]  = {0x01, 0x00};
             const uint8_t cfg_out[2]  = {0x03, 0xFC};
             const uint8_t rst_high[2] = {0x01, 0x01};
             const uint8_t int_in[2]   = {0x03, 0xFE};
-            bus->write(0x18, out_low, 2);
-            bus->write(0x18, cfg_out, 2);
-            delay(20);
-            bus->write(0x18, rst_high, 2);
-            delay(10);
-            bus->write(0x18, int_in, 2);
-            delay(100);
+            uint8_t b = 0;
+            for (int attempt = 1; attempt <= 3; attempt++) {
+              auto e1 = bus->write(0x18, out_low, 2);
+              bus->write(0x18, cfg_out, 2);
+              delay(20 * attempt);
+              bus->write(0x18, rst_high, 2);
+              delay(10 * attempt);
+              bus->write(0x18, int_in, 2);
+              delay(100 * attempt);
+              bool at5d = bus->read(0x5D, &b, 1) == i2c::ERROR_OK;
+              bool at14 = bus->read(0x14, &b, 1) == i2c::ERROR_OK;
+              ESP_LOGW("touch_diag", "attempt %d: expander 0x18 %s, touch 0x5D %s, touch 0x14 %s",
+                       attempt, e1 == i2c::ERROR_OK ? "OK" : "NO ANSWER",
+                       at5d ? "OK" : "no answer", at14 ? "ANSWERS (wrong address)" : "no answer");
+              char buf[96];
+              snprintf(buf, sizeof(buf), "%s (attempt %d; expander %s)",
+                       at5d ? "Touch chip OK" : (at14 ? "Touch chip on WRONG address 0x14" : "Touch chip NOT answering"),
+                       attempt, e1 == i2c::ERROR_OK ? "OK" : "not answering");
+              id(touch_diag) = buf;
+              if (at5d) break;
+            }
 
 esp32:
   board: esp32-s3-devkitc-1
@@ -146,6 +185,7 @@ psram:
 logger:
   level: INFO
   hardware_uart: UART0  # REQUIRED on this board (USB-JTAG default breaks the touch I2C bus)
+  baud_rate: 0          # 3.1.0: no serial logs - IO43/IO44 are the volume knob (logs still work over Wi-Fi)
 
 api:
   encryption:
@@ -170,17 +210,41 @@ captive_portal:
 
 http_request:
   verify_ssl: false
-  timeout: 10s
+  timeout: 5s       # 3.1.1: was 10 s - a slow album-art fetch blocks the whole panel
 
 time:
   - platform: homeassistant
     id: ha_time
+    on_time_sync:
+      - script.execute: clock_update
+    on_time:
+      - seconds: 0
+        then:
+          - script.execute: clock_update
 
 # Memory health (shows in HA under the device's diagnostic entities)
 debug:
   update_interval: 60s
 
 globals:
+  - id: home_timeout_s  # 3.2.0: seconds without a touch before returning home (0 = never)
+    type: int
+    initial_value: '30'
+  - id: cur_nav         # 3.2.0: 0-3 pages, 4 music, 5 library, 6 speakers, 7 climate, 8 home
+    type: int
+    initial_value: '8'
+  - id: touch_diag    # 3.1.2: result of the touch-chip check at boot (shown in HA)
+    type: std::string
+    initial_value: '"not checked"'
+  - id: art_url       # 3.1.1: last album-art URL fetched (skip repeats)
+    type: std::string
+    initial_value: '""'
+  - id: art_pending   # 3.1.1: picture changed while the screen was asleep
+    type: bool
+    initial_value: 'false'
+  - id: knob_vol      # volume target while the knob is turning (-1 = take it from HA)
+    type: int
+    initial_value: '-1'
   - id: np_pos        # media_position (s) at np_ts
     type: float
     initial_value: '0'
@@ -202,7 +266,7 @@ i2c:
   - id: touch_i2c
     sda: 19
     scl: 20
-    scan: false
+    scan: true
     frequency: 400kHz
 
 display:
@@ -255,6 +319,8 @@ touchscreen:
             - script.execute: sync_dyn
             - lvgl.widget.redraw:
             - light.turn_on: backlight
+            - script.execute: art_refresh
+      - script.execute: home_timer
 
 output:
   - platform: ledc
@@ -286,6 +352,9 @@ number:
     entity_category: config
 
 button:
+  - platform: restart
+    name: "Restart"
+    entity_category: config
   - platform: template
     name: "Refresh playlists"
     icon: mdi:playlist-music
@@ -307,11 +376,23 @@ image:
           id: art_img
           src: album_art
       - lvgl.widget.show: art_img
+      - lvgl.image.update:
+          id: home_art
+          src: album_art
+      - lvgl.widget.show: home_art
     on_error:
       - lvgl.widget.hide: art_img
+      - lvgl.widget.hide: home_art
 
 # ───────────── Data from Home Assistant ─────────────
 text_sensor:
+  # 3.1.2 diagnostics: what the touch-chip check found at boot
+  - platform: template
+    name: "Touch status at boot"
+    icon: mdi:gesture-tap
+    entity_category: diagnostic
+    update_interval: 60s
+    lambda: 'return id(touch_diag);'
   - platform: debug
     reset_reason:
       name: "Reset reason"
@@ -331,6 +412,11 @@ text_sensor:
     id: np_state
     entity_id: ${now_playing}
     on_value:
+      - lvgl.label.update:
+          id: home_play_icon
+          text: !lambda |-
+            std::string s = (x == "playing") ? "" : "";
+            return s;
       - lvgl.label.update:
           id: play_icon
           text: !lambda |-
@@ -367,6 +453,11 @@ text_sensor:
           text: !lambda |-
             std::string s = x.empty() ? std::string("Nothing playing") : x;
             return s;
+      - lvgl.label.update:
+          id: home_title
+          text: !lambda |-
+            std::string s = x.empty() ? std::string("Nothing playing") : x;
+            return s;
   - platform: homeassistant
     id: np_artist
     entity_id: ${now_playing}
@@ -374,6 +465,11 @@ text_sensor:
     on_value:
       - lvgl.label.update:
           id: artist_lbl
+          text: !lambda |-
+            std::string s = x;
+            return s;
+      - lvgl.label.update:
+          id: home_artist
           text: !lambda |-
             std::string s = x;
             return s;
@@ -424,14 +520,18 @@ text_sensor:
     on_value:
       - if:
           condition:
-            lambda: 'return !x.empty();'
+            lambda: 'return x.empty();'
           then:
-            - online_image.set_url:
-                id: album_art
-                url: !lambda 'return x;'
-            - component.update: album_art
-          else:
+            - lambda: 'id(art_url) = ""; id(art_pending) = false;'
             - lvgl.widget.hide: art_img
+            - lvgl.widget.hide: home_art
+          else:
+            - if:
+                condition:
+                  lambda: 'return x != id(art_url);'
+                then:
+                  - lambda: 'id(art_url) = x; id(art_pending) = true;'
+                  - script.execute: art_refresh
 
   # Playlist library
   - platform: homeassistant
@@ -453,6 +553,42 @@ text_sensor:
             std::string s = "Source: " + x + "  ";
             return s;
 
+  # 3.2.0 home page: favourites + temperature (from the desktop app, via HA)
+  - platform: homeassistant
+    id: home_labels
+    entity_id: ${layout}
+    attribute: home_labels
+    on_value:
+      - script.execute: sync_dyn
+  - platform: homeassistant
+    id: home_ents
+    entity_id: ${layout}
+    attribute: home_entities
+    on_value:
+      - script.execute: sync_dyn
+  - platform: homeassistant
+    id: home_states
+    entity_id: ${layout}
+    attribute: home_states
+    on_value:
+      - script.execute: sync_dyn
+  - platform: homeassistant
+    id: home_temp_txt
+    entity_id: ${layout}
+    attribute: home_temp
+    on_value:
+      - lvgl.label.update:
+          id: home_temp
+          text: !lambda 'return x;'
+  - platform: homeassistant
+    id: home_temp_name_txt
+    entity_id: ${layout}
+    attribute: home_temp_name
+    on_value:
+      - lvgl.label.update:
+          id: home_temp_name
+          text: !lambda 'return x;'
+
   # Pages 1-4 layout (from the desktop app, via HA)
   - platform: homeassistant
     id: dp1_name
@@ -464,11 +600,15 @@ text_sensor:
           text: !lambda |-
             std::string s = x.empty() ? std::string("Page 1") : x;
             return s;
-      - lvgl.label.update:
-          id: navl_0
-          text: !lambda |-
-            std::string s = x.empty() ? std::string("Page 1") : x;
-            return s;
+      # Bottom bar: blank + not tappable when this page isn't set up in the app
+      - lambda: |-
+          lv_label_set_text(id(navl_0), x.c_str());
+          if (x.empty()) lv_obj_remove_flag(id(nav_b0), LV_OBJ_FLAG_CLICKABLE);
+          else lv_obj_add_flag(id(nav_b0), LV_OBJ_FLAG_CLICKABLE);
+          // home-page shortcut tile
+          lv_label_set_text(id(sc_l0), x.c_str());
+          if (x.empty()) lv_obj_add_flag(id(sc_b0), LV_OBJ_FLAG_HIDDEN);
+          else lv_obj_remove_flag(id(sc_b0), LV_OBJ_FLAG_HIDDEN);
   - platform: homeassistant
     id: dp1_labels
     entity_id: ${layout}
@@ -497,11 +637,15 @@ text_sensor:
           text: !lambda |-
             std::string s = x.empty() ? std::string("Page 2") : x;
             return s;
-      - lvgl.label.update:
-          id: navl_1
-          text: !lambda |-
-            std::string s = x.empty() ? std::string("Page 2") : x;
-            return s;
+      # Bottom bar: blank + not tappable when this page isn't set up in the app
+      - lambda: |-
+          lv_label_set_text(id(navl_1), x.c_str());
+          if (x.empty()) lv_obj_remove_flag(id(nav_b1), LV_OBJ_FLAG_CLICKABLE);
+          else lv_obj_add_flag(id(nav_b1), LV_OBJ_FLAG_CLICKABLE);
+          // home-page shortcut tile
+          lv_label_set_text(id(sc_l1), x.c_str());
+          if (x.empty()) lv_obj_add_flag(id(sc_b1), LV_OBJ_FLAG_HIDDEN);
+          else lv_obj_remove_flag(id(sc_b1), LV_OBJ_FLAG_HIDDEN);
   - platform: homeassistant
     id: dp2_labels
     entity_id: ${layout}
@@ -530,11 +674,15 @@ text_sensor:
           text: !lambda |-
             std::string s = x.empty() ? std::string("Page 3") : x;
             return s;
-      - lvgl.label.update:
-          id: navl_2
-          text: !lambda |-
-            std::string s = x.empty() ? std::string("Page 3") : x;
-            return s;
+      # Bottom bar: blank + not tappable when this page isn't set up in the app
+      - lambda: |-
+          lv_label_set_text(id(navl_2), x.c_str());
+          if (x.empty()) lv_obj_remove_flag(id(nav_b2), LV_OBJ_FLAG_CLICKABLE);
+          else lv_obj_add_flag(id(nav_b2), LV_OBJ_FLAG_CLICKABLE);
+          // home-page shortcut tile
+          lv_label_set_text(id(sc_l2), x.c_str());
+          if (x.empty()) lv_obj_add_flag(id(sc_b2), LV_OBJ_FLAG_HIDDEN);
+          else lv_obj_remove_flag(id(sc_b2), LV_OBJ_FLAG_HIDDEN);
   - platform: homeassistant
     id: dp3_labels
     entity_id: ${layout}
@@ -563,11 +711,15 @@ text_sensor:
           text: !lambda |-
             std::string s = x.empty() ? std::string("Page 4") : x;
             return s;
-      - lvgl.label.update:
-          id: navl_3
-          text: !lambda |-
-            std::string s = x.empty() ? std::string("Page 4") : x;
-            return s;
+      # Bottom bar: blank + not tappable when this page isn't set up in the app
+      - lambda: |-
+          lv_label_set_text(id(navl_3), x.c_str());
+          if (x.empty()) lv_obj_remove_flag(id(nav_b3), LV_OBJ_FLAG_CLICKABLE);
+          else lv_obj_add_flag(id(nav_b3), LV_OBJ_FLAG_CLICKABLE);
+          // home-page shortcut tile
+          lv_label_set_text(id(sc_l3), x.c_str());
+          if (x.empty()) lv_obj_add_flag(id(sc_b3), LV_OBJ_FLAG_HIDDEN);
+          else lv_obj_remove_flag(id(sc_b3), LV_OBJ_FLAG_HIDDEN);
   - platform: homeassistant
     id: dp4_labels
     entity_id: ${layout}
@@ -629,6 +781,27 @@ text_sensor:
             return s;
 
 sensor:
+  # 3.2.0: seconds before an idle page returns home (desktop app → HA)
+  - platform: homeassistant
+    id: home_timeout_ha
+    entity_id: ${layout}
+    attribute: home_timeout
+    internal: true
+    on_value:
+      - lambda: 'if (!std::isnan(x)) id(home_timeout_s) = (int) x;'
+      - script.execute: home_timer
+  # Volume knob (KY-040) on the UART port. If it turns the wrong way, swap the two pin numbers.
+  - platform: rotary_encoder
+    id: vol_knob
+    name: "Volume knob"
+    internal: true
+    pin_a: { number: GPIO44, mode: { input: true, pullup: true } }
+    pin_b: { number: GPIO43, mode: { input: true, pullup: true } }
+    resolution: 1
+    on_clockwise:
+      - script.execute: { id: knob_turn, step: 2 }
+    on_anticlockwise:
+      - script.execute: { id: knob_turn, step: -2 }
   - platform: debug
     free:
       name: "Free internal heap"
@@ -714,6 +887,11 @@ sensor:
 
 # Live progress bar (1 s tick; position is extrapolated between HA updates)
 interval:
+  - interval: 10s
+    then:
+      - lambda: |-
+          uint8_t b = 0;
+          id(touch_alive).publish_state(id(touch_i2c)->read(0x5D, &b, 1) == i2c::ERROR_OK);
   # Safety net: repaint the layout pages every 5 s so they can never drift from HA.
   - interval: 5s
     then:
@@ -752,11 +930,97 @@ interval:
 
 # Reusable actions
 script:
+  # 3.2.0: clock + date on the home page (12-hour)
+  - id: clock_update
+    then:
+      - lambda: |-
+          auto t = id(ha_time).now();
+          if (!t.is_valid()) return;
+          int h = t.hour % 12; if (h == 0) h = 12;
+          char buf[16];
+          snprintf(buf, sizeof(buf), "%d:%02d", h, t.minute);
+          lv_label_set_text(id(home_clock), buf);
+          lv_label_set_text(id(home_ampm), t.hour < 12 ? "AM" : "PM");
+          lv_obj_align_to(id(home_ampm), id(home_clock), LV_ALIGN_OUT_RIGHT_TOP, 6, 20);
+          lv_label_set_text(id(home_date), t.strftime("%A, %B %d").c_str());
+  # 3.2.0: go back to the home page after home_timeout_s without a touch.
+  # Restarted by every touch, knob turn and page change; Music and Home never time out.
+  - id: home_timer
+    mode: restart
+    then:
+      - if:
+          condition:
+            lambda: 'return id(home_timeout_s) > 0 && id(cur_nav) != 8 && id(cur_nav) != 4;'
+          then:
+            - delay: !lambda 'return (uint32_t) id(home_timeout_s) * 1000;'
+            - if:
+                condition:
+                  lambda: 'return id(cur_nav) != 8 && id(cur_nav) != 4;'
+                then:
+                  - lvgl.page.show: home_page
+                  - script.execute: { id: set_nav, idx: 8 }
+  # 3.1.1: fetch album art only when needed and only while the screen is on
+  - id: art_refresh
+    mode: single
+    then:
+      - if:
+          condition:
+            and:
+              - lambda: 'return id(art_pending) && !id(art_url).empty();'
+              - not: lvgl.is_paused
+          then:
+            - lambda: 'id(art_pending) = false;'
+            - online_image.set_url:
+                id: album_art
+                url: !lambda 'return id(art_url);'
+            - component.update: album_art
+  # Knob: wake the screen, move the slider right away, send the volume once you stop turning.
+  - id: knob_turn
+    mode: queued
+    max_runs: 20
+    parameters:
+      step: int
+    then:
+      - if:
+          condition: lvgl.is_paused
+          then:
+            - lvgl.resume:
+            - script.execute: sync_dyn
+            - lvgl.widget.redraw:
+            - light.turn_on: backlight
+            - script.execute: art_refresh
+      - script.execute: home_timer
+      - lambda: |-
+          lv_display_trigger_activity(nullptr);   // keeps the sleep timer from firing
+          if (id(knob_vol) < 0)
+            id(knob_vol) = std::isnan(id(np_volume).state) ? 20 : (int) id(np_volume).state;
+          id(knob_vol) = std::max(0, std::min(100, id(knob_vol) + step));
+      - lvgl.slider.update:
+          id: vol_slider
+          value: !lambda 'return id(knob_vol);'
+      - script.execute: knob_send
+      - script.execute: home_timer
+  - id: knob_send
+    mode: restart
+    then:
+      - delay: 150ms
+      - script.execute:
+          id: set_volume
+          pct: !lambda 'return id(knob_vol);'
+      - delay: 3s
+      - lambda: 'id(knob_vol) = -1;'
   # Re-paint pages 1-4 (labels + green/black) from the latest HA layout sensor.
   - id: sync_dyn
     mode: restart
     then:
       - lambda: |-
+            { lv_obj_t *const b[] = {id(hf_b0), id(hf_b1), id(hf_b2), id(hf_b3), id(hf_b4), id(hf_b5), id(hf_b6), id(hf_b7)};
+              lv_obj_t *const l[] = {id(hf_l0), id(hf_l1), id(hf_l2), id(hf_l3), id(hf_l4), id(hf_l5), id(hf_l6), id(hf_l7)};
+              desk_layout::apply_labels(b, l, 8, id(home_labels).state, id(home_ents).state);
+              desk_layout::apply_states(b, 8, id(home_states).state);
+              lv_obj_t *const hint = id(home_fav_hint);
+              if (id(home_ents).state.empty()) lv_obj_remove_flag(hint, LV_OBJ_FLAG_HIDDEN);
+              else lv_obj_add_flag(hint, LV_OBJ_FLAG_HIDDEN); }
             { lv_obj_t *const b[] = {id(dp1_b0), id(dp1_b1), id(dp1_b2), id(dp1_b3), id(dp1_b4), id(dp1_b5), id(dp1_b6), id(dp1_b7), id(dp1_b8), id(dp1_b9), id(dp1_b10), id(dp1_b11)};
               lv_obj_t *const l[] = {id(dp1_l0), id(dp1_l1), id(dp1_l2), id(dp1_l3), id(dp1_l4), id(dp1_l5), id(dp1_l6), id(dp1_l7), id(dp1_l8), id(dp1_l9), id(dp1_l10), id(dp1_l11)};
               desk_layout::apply_labels(b, l, 12, id(dp1_labels).state, id(dp1_ents).state);
@@ -801,11 +1065,15 @@ script:
       idx: int
     then:
       - lambda: |-
-          lv_obj_t *const navs[] = {id(nav_b0), id(nav_b1), id(nav_b2), id(nav_b3), id(nav_b4), id(nav_b5), id(nav_b6), id(nav_b7)};
-          for (int i = 0; i < 8; i++) {
+          lv_obj_t *const navs[] = {id(nav_b0), id(nav_b1), id(nav_b2), id(nav_b3), id(nav_b4), id(nav_b5), id(nav_b6), id(nav_b7), id(nav_bh)};
+          for (int i = 0; i < 9; i++) {
             if (i == idx) lv_obj_add_state(navs[i], LV_STATE_CHECKED);
             else lv_obj_remove_state(navs[i], LV_STATE_CHECKED);
           }
+          id(cur_nav) = idx;
+          if (idx == 8) lv_obj_add_flag(id(nav), LV_OBJ_FLAG_HIDDEN);
+          else lv_obj_remove_flag(id(nav), LV_OBJ_FLAG_HIDDEN);
+      - script.execute: home_timer
   - id: ma_action
     parameters:
       svc: string
@@ -850,6 +1118,8 @@ lvgl:
   on_idle:
     timeout: !lambda 'return (uint32_t) (id(screen_timeout).state * 60000);'
     then:
+      - lvgl.page.show: home_page
+      - script.execute: { id: set_nav, idx: 8 }
       - light.turn_off: backlight
       - lvgl.pause:
 
@@ -907,10 +1177,26 @@ lvgl:
           scrollable: false
           widgets:
             - button:
-                id: nav_b0
+                id: nav_bh
                 x: 0
                 y: 0
-                width: 100
+                width: 80
+                height: 64
+                radius: 0
+                border_width: 0
+                on_click:
+                  - lvgl.page.show: home_page
+                  - script.execute: { id: set_nav, idx: 8 }
+                widgets:
+                  - label:
+                      align: CENTER
+                      text_font: montserrat_24
+                      text: ""
+            - button:
+                id: nav_b0
+                x: 80
+                y: 0
+                width: 90
                 height: 64
                 radius: 0
                 border_width: 0
@@ -921,16 +1207,16 @@ lvgl:
                   - label:
                       id: navl_0
                       align: CENTER
-                      width: 94
+                      width: 84
                       text_align: CENTER
                       long_mode: DOT
                       text_font: montserrat_16
-                      text: "Page 1"
+                      text: ""
             - button:
                 id: nav_b1
-                x: 100
+                x: 170
                 y: 0
-                width: 100
+                width: 90
                 height: 64
                 radius: 0
                 border_width: 0
@@ -941,16 +1227,16 @@ lvgl:
                   - label:
                       id: navl_1
                       align: CENTER
-                      width: 94
+                      width: 84
                       text_align: CENTER
                       long_mode: DOT
                       text_font: montserrat_16
-                      text: "Page 2"
+                      text: ""
             - button:
                 id: nav_b2
-                x: 200
+                x: 260
                 y: 0
-                width: 100
+                width: 90
                 height: 64
                 radius: 0
                 border_width: 0
@@ -961,16 +1247,16 @@ lvgl:
                   - label:
                       id: navl_2
                       align: CENTER
-                      width: 94
+                      width: 84
                       text_align: CENTER
                       long_mode: DOT
                       text_font: montserrat_16
-                      text: "Page 3"
+                      text: ""
             - button:
                 id: nav_b3
-                x: 300
+                x: 350
                 y: 0
-                width: 100
+                width: 90
                 height: 64
                 radius: 0
                 border_width: 0
@@ -981,16 +1267,16 @@ lvgl:
                   - label:
                       id: navl_3
                       align: CENTER
-                      width: 94
+                      width: 84
                       text_align: CENTER
                       long_mode: DOT
                       text_font: montserrat_16
-                      text: "Page 4"
+                      text: ""
             - button:
                 id: nav_b4
-                x: 400
+                x: 440
                 y: 0
-                width: 100
+                width: 90
                 height: 64
                 radius: 0
                 border_width: 0
@@ -1001,16 +1287,16 @@ lvgl:
                   - label:
                       id: navl_4
                       align: CENTER
-                      width: 94
+                      width: 84
                       text_align: CENTER
                       long_mode: DOT
                       text_font: montserrat_16
                       text: "\uF001 Music"
             - button:
                 id: nav_b5
-                x: 500
+                x: 530
                 y: 0
-                width: 100
+                width: 90
                 height: 64
                 radius: 0
                 border_width: 0
@@ -1021,16 +1307,16 @@ lvgl:
                   - label:
                       id: navl_5
                       align: CENTER
-                      width: 94
+                      width: 84
                       text_align: CENTER
                       long_mode: DOT
                       text_font: montserrat_16
                       text: "\uF00B Library"
             - button:
                 id: nav_b6
-                x: 600
+                x: 620
                 y: 0
-                width: 100
+                width: 90
                 height: 64
                 radius: 0
                 border_width: 0
@@ -1041,16 +1327,16 @@ lvgl:
                   - label:
                       id: navl_6
                       align: CENTER
-                      width: 94
+                      width: 84
                       text_align: CENTER
                       long_mode: DOT
                       text_font: montserrat_16
                       text: "\uF028 Speakers"
             - button:
                 id: nav_b7
-                x: 700
+                x: 710
                 y: 0
-                width: 100
+                width: 90
                 height: 64
                 radius: 0
                 border_width: 0
@@ -1061,13 +1347,512 @@ lvgl:
                   - label:
                       id: navl_7
                       align: CENTER
-                      width: 94
+                      width: 84
                       text_align: CENTER
                       long_mode: DOT
                       text_font: montserrat_16
                       text: "\uF013 Climate"
 
   pages:
+    # ─── HOME (3.2.0) ───
+    - id: home_page
+      styles: page_style
+      widgets:
+        - label:
+            id: home_clock
+            x: 24
+            y: 8
+            text_font: montserrat_48
+            text_color: 0xFFFFFF
+            text: "--:--"
+        - label:
+            id: home_ampm
+            x: 160
+            y: 30
+            text_font: montserrat_20
+            text_color: 0xA0A4AB
+            text: ""
+        - label:
+            id: home_date
+            x: 26
+            y: 66
+            text_font: montserrat_20
+            text_color: 0xA0A4AB
+            text: ""
+        - label:
+            id: home_temp
+            align: TOP_RIGHT
+            x: -24
+            y: 14
+            text_font: montserrat_48
+            text_color: 0xFFFFFF
+            text: ""
+        - label:
+            id: home_temp_name
+            align: TOP_RIGHT
+            x: -26
+            y: 68
+            text_font: montserrat_16
+            text_color: 0xA0A4AB
+            text: ""
+        # Now playing (tap anywhere on it for the Music page)
+        - obj:
+            id: home_np
+            x: 24
+            y: 104
+            width: 752
+            height: 88
+            radius: 14
+            bg_color: 0x000000
+            border_width: 2
+            border_color: 0x4A4D55
+            pad_all: 0
+            scrollable: false
+            on_click:
+              - lvgl.page.show: music_page
+              - script.execute: { id: set_nav, idx: 4 }
+            widgets:
+              - obj:
+                  x: 10
+                  y: 10
+                  width: 64
+                  height: 64
+                  radius: 8
+                  pad_all: 0
+                  border_width: 0
+                  bg_color: 0x000000
+                  clip_corner: true
+                  scrollable: false
+                  clickable: false
+                  widgets:
+                    - label:
+                        align: CENTER
+                        text_font: montserrat_24
+                        text_color: 0x55585F
+                        text: "\uf001"
+                    - image:
+                        id: home_art
+                        align: CENTER
+                        src: album_art
+                        zoom: 0.25
+                        hidden: true
+              - label:
+                  id: home_title
+                  x: 90
+                  y: 14
+                  width: 480
+                  long_mode: DOT
+                  text_font: montserrat_20
+                  text_color: 0xFFFFFF
+                  text: "Nothing playing"
+              - label:
+                  id: home_artist
+                  x: 90
+                  y: 46
+                  width: 480
+                  long_mode: DOT
+                  text_font: montserrat_16
+                  text_color: 0xA0A4AB
+                  text: ""
+              - button:
+                  align: RIGHT_MID
+                  x: -90
+                  width: 68
+                  height: 64
+                  on_click:
+                    - homeassistant.action:
+                        action: script.desk_panel_play_pause
+                  widgets:
+                    - label:
+                        id: home_play_icon
+                        align: CENTER
+                        text_font: montserrat_24
+                        text: "\uf04b"
+              - button:
+                  align: RIGHT_MID
+                  x: -12
+                  width: 68
+                  height: 64
+                  on_click:
+                    - script.execute: { id: ma_action, svc: media_player.media_next_track }
+                  widgets:
+                    - label:
+                        align: CENTER
+                        text_font: montserrat_24
+                        text: "\uf051"
+        # Favourites (picked in the desktop app: Edit layout → Home screen)
+        - label:
+            id: home_fav_hint
+            x: 24
+            y: 280
+            width: 752
+            text_align: CENTER
+            text_font: montserrat_16
+            text_color: 0x55585F
+            text: "Add favourite buttons in the desktop app: Edit layout > Home screen"
+        - button:
+            id: hf_b0
+            x: 24
+            y: 204
+            width: 176
+            height: 80
+            checkable: true
+            hidden: true
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !desk_layout::entity_at(id(home_ents).state, 0).empty();'
+                  then:
+                    - homeassistant.action:
+                        action: script.desk_panel_tap
+                        data:
+                          entity: !lambda 'return desk_layout::entity_at(id(home_ents).state, 0);'
+                    - script.execute: sync_dyn_later
+            widgets:
+              - label:
+                  id: hf_l0
+                  align: CENTER
+                  width: 164
+                  text_align: CENTER
+                  text_font: montserrat_16
+                  long_mode: DOT
+                  text: ""
+        - button:
+            id: hf_b1
+            x: 216
+            y: 204
+            width: 176
+            height: 80
+            checkable: true
+            hidden: true
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !desk_layout::entity_at(id(home_ents).state, 1).empty();'
+                  then:
+                    - homeassistant.action:
+                        action: script.desk_panel_tap
+                        data:
+                          entity: !lambda 'return desk_layout::entity_at(id(home_ents).state, 1);'
+                    - script.execute: sync_dyn_later
+            widgets:
+              - label:
+                  id: hf_l1
+                  align: CENTER
+                  width: 164
+                  text_align: CENTER
+                  text_font: montserrat_16
+                  long_mode: DOT
+                  text: ""
+        - button:
+            id: hf_b2
+            x: 408
+            y: 204
+            width: 176
+            height: 80
+            checkable: true
+            hidden: true
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !desk_layout::entity_at(id(home_ents).state, 2).empty();'
+                  then:
+                    - homeassistant.action:
+                        action: script.desk_panel_tap
+                        data:
+                          entity: !lambda 'return desk_layout::entity_at(id(home_ents).state, 2);'
+                    - script.execute: sync_dyn_later
+            widgets:
+              - label:
+                  id: hf_l2
+                  align: CENTER
+                  width: 164
+                  text_align: CENTER
+                  text_font: montserrat_16
+                  long_mode: DOT
+                  text: ""
+        - button:
+            id: hf_b3
+            x: 600
+            y: 204
+            width: 176
+            height: 80
+            checkable: true
+            hidden: true
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !desk_layout::entity_at(id(home_ents).state, 3).empty();'
+                  then:
+                    - homeassistant.action:
+                        action: script.desk_panel_tap
+                        data:
+                          entity: !lambda 'return desk_layout::entity_at(id(home_ents).state, 3);'
+                    - script.execute: sync_dyn_later
+            widgets:
+              - label:
+                  id: hf_l3
+                  align: CENTER
+                  width: 164
+                  text_align: CENTER
+                  text_font: montserrat_16
+                  long_mode: DOT
+                  text: ""
+        - button:
+            id: hf_b4
+            x: 24
+            y: 296
+            width: 176
+            height: 80
+            checkable: true
+            hidden: true
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !desk_layout::entity_at(id(home_ents).state, 4).empty();'
+                  then:
+                    - homeassistant.action:
+                        action: script.desk_panel_tap
+                        data:
+                          entity: !lambda 'return desk_layout::entity_at(id(home_ents).state, 4);'
+                    - script.execute: sync_dyn_later
+            widgets:
+              - label:
+                  id: hf_l4
+                  align: CENTER
+                  width: 164
+                  text_align: CENTER
+                  text_font: montserrat_16
+                  long_mode: DOT
+                  text: ""
+        - button:
+            id: hf_b5
+            x: 216
+            y: 296
+            width: 176
+            height: 80
+            checkable: true
+            hidden: true
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !desk_layout::entity_at(id(home_ents).state, 5).empty();'
+                  then:
+                    - homeassistant.action:
+                        action: script.desk_panel_tap
+                        data:
+                          entity: !lambda 'return desk_layout::entity_at(id(home_ents).state, 5);'
+                    - script.execute: sync_dyn_later
+            widgets:
+              - label:
+                  id: hf_l5
+                  align: CENTER
+                  width: 164
+                  text_align: CENTER
+                  text_font: montserrat_16
+                  long_mode: DOT
+                  text: ""
+        - button:
+            id: hf_b6
+            x: 408
+            y: 296
+            width: 176
+            height: 80
+            checkable: true
+            hidden: true
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !desk_layout::entity_at(id(home_ents).state, 6).empty();'
+                  then:
+                    - homeassistant.action:
+                        action: script.desk_panel_tap
+                        data:
+                          entity: !lambda 'return desk_layout::entity_at(id(home_ents).state, 6);'
+                    - script.execute: sync_dyn_later
+            widgets:
+              - label:
+                  id: hf_l6
+                  align: CENTER
+                  width: 164
+                  text_align: CENTER
+                  text_font: montserrat_16
+                  long_mode: DOT
+                  text: ""
+        - button:
+            id: hf_b7
+            x: 600
+            y: 296
+            width: 176
+            height: 80
+            checkable: true
+            hidden: true
+            on_click:
+              - if:
+                  condition:
+                    lambda: 'return !desk_layout::entity_at(id(home_ents).state, 7).empty();'
+                  then:
+                    - homeassistant.action:
+                        action: script.desk_panel_tap
+                        data:
+                          entity: !lambda 'return desk_layout::entity_at(id(home_ents).state, 7);'
+                    - script.execute: sync_dyn_later
+            widgets:
+              - label:
+                  id: hf_l7
+                  align: CENTER
+                  width: 164
+                  text_align: CENTER
+                  text_font: montserrat_16
+                  long_mode: DOT
+                  text: ""
+        # Shortcuts to every page (flex row: unused pages collapse)
+        - obj:
+            x: 24
+            y: 396
+            width: 752
+            height: 72
+            pad_all: 0
+            bg_opa: TRANSP
+            border_width: 0
+            scrollable: false
+            layout:
+              type: flex
+              flex_flow: ROW
+              pad_column: 8
+            widgets:
+              - button:
+                  id: sc_b0
+                  width: 87
+                  height: 72
+                  hidden: true
+                  on_click:
+                    - lvgl.page.show: dp1
+                    - script.execute: { id: set_nav, idx: 0 }
+                  widgets:
+                    - label:
+                        id: sc_l0
+                        align: CENTER
+                        width: 81
+                        text_align: CENTER
+                        text_font: montserrat_16
+                        long_mode: DOT
+                        text: ""
+              - button:
+                  id: sc_b1
+                  width: 87
+                  height: 72
+                  hidden: true
+                  on_click:
+                    - lvgl.page.show: dp2
+                    - script.execute: { id: set_nav, idx: 1 }
+                  widgets:
+                    - label:
+                        id: sc_l1
+                        align: CENTER
+                        width: 81
+                        text_align: CENTER
+                        text_font: montserrat_16
+                        long_mode: DOT
+                        text: ""
+              - button:
+                  id: sc_b2
+                  width: 87
+                  height: 72
+                  hidden: true
+                  on_click:
+                    - lvgl.page.show: dp3
+                    - script.execute: { id: set_nav, idx: 2 }
+                  widgets:
+                    - label:
+                        id: sc_l2
+                        align: CENTER
+                        width: 81
+                        text_align: CENTER
+                        text_font: montserrat_16
+                        long_mode: DOT
+                        text: ""
+              - button:
+                  id: sc_b3
+                  width: 87
+                  height: 72
+                  hidden: true
+                  on_click:
+                    - lvgl.page.show: dp4
+                    - script.execute: { id: set_nav, idx: 3 }
+                  widgets:
+                    - label:
+                        id: sc_l3
+                        align: CENTER
+                        width: 81
+                        text_align: CENTER
+                        text_font: montserrat_16
+                        long_mode: DOT
+                        text: ""
+              - button:
+                  id: sc_bx4
+                  width: 87
+                  height: 72
+                  on_click:
+                    - lvgl.page.show: music_page
+                    - script.execute: { id: set_nav, idx: 4 }
+                  widgets:
+                    - label:
+                        id: sc_lx4
+                        align: CENTER
+                        width: 81
+                        text_align: CENTER
+                        text_font: montserrat_16
+                        long_mode: DOT
+                        text: "\uf001\nMusic"
+              - button:
+                  id: sc_bx5
+                  width: 87
+                  height: 72
+                  on_click:
+                    - lvgl.page.show: library_page
+                    - script.execute: { id: set_nav, idx: 5 }
+                  widgets:
+                    - label:
+                        id: sc_lx5
+                        align: CENTER
+                        width: 81
+                        text_align: CENTER
+                        text_font: montserrat_16
+                        long_mode: DOT
+                        text: "\uf00b\nLibrary"
+              - button:
+                  id: sc_bx6
+                  width: 87
+                  height: 72
+                  on_click:
+                    - lvgl.page.show: speakers_page
+                    - script.execute: { id: set_nav, idx: 6 }
+                  widgets:
+                    - label:
+                        id: sc_lx6
+                        align: CENTER
+                        width: 81
+                        text_align: CENTER
+                        text_font: montserrat_16
+                        long_mode: DOT
+                        text: "\uf028\nSpeakers"
+              - button:
+                  id: sc_bx7
+                  width: 87
+                  height: 72
+                  on_click:
+                    - lvgl.page.show: climate_page
+                    - script.execute: { id: set_nav, idx: 7 }
+                  widgets:
+                    - label:
+                        id: sc_lx7
+                        align: CENTER
+                        width: 81
+                        text_align: CENTER
+                        text_font: montserrat_16
+                        long_mode: DOT
+                        text: "\uf013\nClimate"
     # ─── PAGE 1 (layout from the desktop app) ───
     - id: dp1
       styles: page_style
@@ -2948,26 +3733,24 @@ lvgl:
             widgets:
               - label: { align: CENTER, text: " Off", text_font: montserrat_24 }
 
-# ───────────── OPTIONAL: EC11 volume knob (KY-040) ─────────────
-# Wiring: CLK -> IO44, DT -> IO43 (UART header), SW -> IO38 (GPIO_D), + -> 3V3, GND.
-# To use: set `logger: baud_rate: 0`, remove the GPIO38 lines from the first on_boot
-# lambda, and uncomment below (merge into the existing sensor:/binary_sensor: lists).
+binary_sensor:
+  # 3.1.2 diagnostics: is the touch chip answering right now? (checked every 10 s)
+  - platform: template
+    id: touch_alive
+    name: "Touch chip responding"
+    icon: mdi:gesture-tap-button
+    entity_category: diagnostic
+
+# ───────────── OPTIONAL: knob PRESS (needs a 2nd cable) ─────────────
+# Wire KY-040 SW -> GPIO_D port pin 1 (IO38). Then remove the GPIO38 lines from the
+# first on_boot lambda and uncomment this (merge into the existing binary_sensor: list).
+# If presses fire by themselves when you touch the screen, IO38 is linked to the touch
+# chip on your board: leave this disabled.
 #
-# sensor:
-#   - platform: rotary_encoder
-#     id: vol_knob
-#     pin_a: { number: 44, mode: { input: true, pullup: true } }
-#     pin_b: { number: 43, mode: { input: true, pullup: true } }
-#     resolution: 1
-#     filters: [ debounce: 5ms ]
-#     on_clockwise:
-#       - script.execute: { id: set_volume, pct: !lambda 'return std::min(100, (int) id(np_volume).state + 3);' }
-#     on_anticlockwise:
-#       - script.execute: { id: set_volume, pct: !lambda 'return std::max(0, (int) id(np_volume).state - 3);' }
 # binary_sensor:
 #   - platform: gpio
 #     id: knob_press
-#     pin: { number: 38, mode: { input: true, pullup: true }, inverted: true }
+#     pin: { number: GPIO38, mode: { input: true, pullup: true }, inverted: true }
 #     filters: [ delayed_on: 20ms ]
 #     on_click:
 #       - script.execute: { id: ma_action, svc: media_player.media_play_pause }

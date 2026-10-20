@@ -147,7 +147,8 @@ class PanelWindow(QWidget):
         """Send the 📟 pages to HA for the CrowPanel when they differ from HA's copy."""
         if not self.store.states:
             return  # not connected yet — runs again when states arrive
-        has_panel_pages = any(p.get("panel") for p in self.cfg.get("pages", []))
+        has_panel_pages = (any(p.get("panel") for p in self.cfg.get("pages", []))
+                           or bool((self.cfg.get("home") or {}).get("tiles")))
         if not has_panel_pages and self.store.get(panel_sync.STORE_ENTITY) is None:
             return
         if force or panel_sync.needs_push(self.cfg, self.store):
@@ -217,8 +218,9 @@ class PanelWindow(QWidget):
     def edit_layout(self):
         dlg = LayoutEditor(self.cfg, self.store, self)
         if self._exec(dlg):
-            pages, music_on = dlg.result_config()
+            pages, music_on, home = dlg.result_config()
             self.cfg["pages"] = pages
+            self.cfg["home"] = home
             self.cfg.setdefault("music", {})["enabled"] = music_on
             self._save_and_rebuild()
 

@@ -5,9 +5,9 @@ from __future__ import annotations
 import copy
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import (QComboBox, QDialog, QDialogButtonBox,
+from PySide6.QtWidgets import (QComboBox, QDialog, QDialogButtonBox, QFormLayout,
                                QHBoxLayout, QLabel, QLineEdit, QListWidget,
-                               QListWidgetItem, QPushButton, QVBoxLayout)
+                               QListWidgetItem, QPushButton, QSpinBox, QVBoxLayout)
 
 from . import dialogs
 
@@ -76,6 +76,132 @@ class EntityPicker(QDialog):
         return [it.data(Qt.UserRole) for it in self.list.selectedItems()]
 
 
+HOME_SLOTS = 8
+DEFAULT_HOME = {"tiles": [], "timeout": 30, "temp_entity": ""}
+
+
+class HomeEditor(QDialog):
+    """CrowPanel home screen: favourite buttons, return-to-home timeout, temperature."""
+
+    def __init__(self, home: dict, store, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("CrowPanel home screen")
+        self.resize(600, 560)
+        self.store = store
+        self.home = copy.deepcopy({**DEFAULT_HOME, **(home or {})})
+        lay = QVBoxLayout(self)
+        t = QLabel(f"Favourite buttons (up to {HOME_SLOTS})")
+        t.setObjectName("Title")
+        lay.addWidget(t)
+        self.list = QListWidget()
+        self.list.setDragDropMode(QListWidget.InternalMove)
+        self.list.model().rowsMoved.connect(self._sync_order)
+        self.list.itemDoubleClicked.connect(lambda _: self._rename())
+        lay.addWidget(self.list, 1)
+        row = QHBoxLayout()
+        for txt, fn in (("＋ Add", self._add), ("Rename", self._rename),
+                        ("▲", lambda: self._move(-1)), ("▼", lambda: self._move(1)),
+                        ("🗑 Remove", self._remove)):
+            b = QPushButton(txt)
+            b.clicked.connect(fn)
+            row.addWidget(b)
+        lay.addLayout(row)
+
+        form = QFormLayout()
+        self.timeout = QSpinBox()
+        self.timeout.setRange(0, 600)
+        self.timeout.setSingleStep(5)
+        self.timeout.setSuffix(" s")
+        self.timeout.setSpecialValueText("never")
+        self.timeout.setValue(int(self.home.get("timeout", 30)))
+        form.addRow("Return to home after", self.timeout)
+        self.temp = QComboBox()
+        self.temp.addItem("(don't show)", "")
+        temps = []
+        for eid, st in store.states.items():
+            a = st.get("attributes", {})
+            if eid.startswith("climate.") or (eid.startswith("sensor.") and a.get("device_class") == "temperature"):
+                temps.append((a.get("friendly_name", eid).lower(), a.get("friendly_name", eid), eid, st.get("state")))
+        cur = self.home.get("temp_entity", "")
+        if cur and cur not in {t[2] for t in temps}:
+            temps.append((cur, cur, cur, "not in HA"))
+        for _, name, eid, state in sorted(temps):
+            self.temp.addItem(f"{name}  —  {eid}  [{state}]", eid)
+        i = self.temp.findData(cur)
+        self.temp.setCurrentIndex(i if i >= 0 else 0)
+        form.addRow("Temperature shown", self.temp)
+        lay.addLayout(form)
+        hint = QLabel("The panel starts on this screen. Any page except Music goes back to it after the "
+                      "time above without a touch (\"never\" turns that off). Shortcuts to every page are "
+                      "added automatically. Changes reach the panel when you press Save in Edit layout.")
+        hint.setWordWrap(True)
+        hint.setProperty("muted", True)
+        lay.addWidget(hint)
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+        self._fill()
+
+    def _fill(self, select: int | None = None):
+        self.list.clear()
+        for t in self.home["tiles"]:
+            eid = t["entity_id"]
+            label = t.get("label") or self.store.name(eid)
+            ok = self.store.get(eid) is not None
+            it = QListWidgetItem(f"{DOMAIN_ICON.get(domain_of(eid), '●')}  {label}    —  {eid}"
+                                 + ("" if ok else "   ⚠ not in HA"))
+            it.setData(Qt.UserRole, t)
+            self.list.addItem(it)
+        if select is not None and 0 <= select < self.list.count():
+            self.list.setCurrentRow(select)
+
+    def _sync_order(self, *_):
+        self.home["tiles"] = [self.list.item(i).data(Qt.UserRole) for i in range(self.list.count())]
+
+    def _add(self):
+        free = HOME_SLOTS - len(self.home["tiles"])
+        if free <= 0:
+            dialogs.info(self, "Home screen", f"The home screen holds {HOME_SLOTS} favourites. Remove one first.")
+            return
+        dlg = EntityPicker(self.store, {t["entity_id"] for t in self.home["tiles"]}, self)
+        if dialogs.run(dlg, self):
+            picked = dlg.selected()
+            for eid in picked[:free]:
+                self.home["tiles"].append({"entity_id": eid, "label": ""})
+            if len(picked) > free:
+                dialogs.info(self, "Home screen", f"Only the first {free} were added (limit {HOME_SLOTS}).")
+            self._fill(len(self.home["tiles"]) - 1)
+
+    def _rename(self):
+        r = self.list.currentRow()
+        if r < 0:
+            return
+        t = self.home["tiles"][r]
+        name, ok = dialogs.ask_text(self, "Rename button", "Label (empty = HA name):",
+                                    t.get("label") or self.store.name(t["entity_id"]))
+        if ok:
+            t["label"] = name.strip()
+            self._fill(r)
+
+    def _move(self, d):
+        r = self.list.currentRow()
+        tl = self.home["tiles"]
+        if r >= 0 and 0 <= r + d < len(tl):
+            tl[r], tl[r + d] = tl[r + d], tl[r]
+            self._fill(r + d)
+
+    def _remove(self):
+        r = self.list.currentRow()
+        if r >= 0:
+            self.home["tiles"].pop(r)
+            self._fill(min(r, len(self.home["tiles"]) - 1))
+
+    def home_result(self) -> dict:
+        return {"tiles": self.home["tiles"][:HOME_SLOTS], "timeout": self.timeout.value(),
+                "temp_entity": self.temp.currentData() or ""}
+
+
 class LayoutEditor(QDialog):
     def __init__(self, cfg: dict, store, parent=None):
         super().__init__(parent)
@@ -84,6 +210,7 @@ class LayoutEditor(QDialog):
         self.store = store
         self.pages = copy.deepcopy(cfg.get("pages", []))
         self.music_enabled = cfg.get("music", {}).get("enabled", True)
+        self.home = copy.deepcopy({**DEFAULT_HOME, **(cfg.get("home") or {})})
 
         root = QHBoxLayout(self)
         # pages column
@@ -110,6 +237,12 @@ class LayoutEditor(QDialog):
         self.panel_cb.toggled.connect(self._panel_toggled)
         self._panel_text(False)
         left.addWidget(self.panel_cb)
+        self.home_btn = QPushButton()
+        self.home_btn.setMinimumHeight(34)
+        self.home_btn.setToolTip("Favourite buttons, return-to-home timeout and temperature for the CrowPanel home screen")
+        self.home_btn.clicked.connect(self._edit_home)
+        self._home_text()
+        left.addWidget(self.home_btn)
         self.panel_info = QLabel()
         self.panel_info.setProperty("muted", True)
         self.panel_info.setWordWrap(True)
@@ -149,6 +282,18 @@ class LayoutEditor(QDialog):
         l = QLabel(t)
         l.setObjectName("Title")
         return l
+
+    # home screen
+    def _home_text(self):
+        n, to = len(self.home.get("tiles", [])), int(self.home.get("timeout", 30))
+        self.home_btn.setText(f"🏠 CrowPanel home screen…  ({n}/{HOME_SLOTS}, "
+                              + ("no auto-return)" if to == 0 else f"back after {to} s)"))
+
+    def _edit_home(self):
+        dlg = HomeEditor(self.home, self.store, self)
+        if dialogs.run(dlg, self):
+            self.home = dlg.home_result()
+            self._home_text()
 
     # pages
     def _fill_pages(self, select: int = 0):
@@ -289,5 +434,5 @@ class LayoutEditor(QDialog):
             p["tiles"].pop(r)
         self._fill_pages(self.page_list.currentRow())
 
-    def result_config(self) -> tuple[list, bool]:
-        return self.pages, self.music_cb.isChecked()
+    def result_config(self) -> tuple[list, bool, dict]:
+        return self.pages, self.music_cb.isChecked(), self.home

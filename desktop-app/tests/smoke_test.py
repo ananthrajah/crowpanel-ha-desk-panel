@@ -102,6 +102,24 @@ def main():
     assert len(pushes()) == n, "re-sent an unchanged layout"
     print(f"✓ CrowPanel layout pushed to HA on connect + on edit ({n} pushes), unchanged layout not re-sent")
 
+    # home screen (favourites + timeout) travels with the layout
+    tray.cfg["home"] = {"tiles": [{"entity_id": "light.desk_lamp", "label": "Lamp"}], "timeout": 45,
+                        "temp_entity": "climate.home_thermostat"}
+    tray.win._save_and_rebuild()
+    pump(app, 2, until=lambda: any(c["event_data"].get("home", {}).get("timeout") == 45 for c in pushes()))
+    h = pushes()[-1]["event_data"]["home"]
+    assert h == {"tiles": [{"entity_id": "light.desk_lamp", "label": "Lamp"}], "timeout": 45,
+                 "temp_entity": "climate.home_thermostat"}, h
+    pump(app, 2, until=lambda: (tray.store.attr("sensor.desk_panel_layout_store", "home") or {}).get("timeout") == 45)
+    n = len(pushes()); tray.win.sync_panel(); pump(app, 0.5)
+    assert len(pushes()) == n, "re-sent an unchanged home screen"
+    from deskpanel.editor import HomeEditor
+    he = HomeEditor(tray.cfg["home"], tray.store)
+    he.timeout.setValue(0)
+    r = he.home_result()
+    assert r["timeout"] == 0 and r["temp_entity"] == "climate.home_thermostat" and len(r["tiles"]) == 1, r
+    print("✓ home screen: favourites/timeout/temperature pushed to HA, editor round-trips")
+
     # quick-remove
     tray.win._quick_remove(0, tiles["switch.does_not_exist"])
     pump(app, 0.5)

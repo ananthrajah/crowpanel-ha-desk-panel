@@ -1,4 +1,4 @@
-# Desk Panel Tray — v0.2.2
+# Desk Panel Tray — v0.3.0
 
 A Windows system-tray control panel for Home Assistant. It works alongside the CrowPanel
 desk panel (same pages + a Music tab), but the layout lives in a settings file you edit **inside
@@ -49,7 +49,11 @@ In **✎ Edit layout**, select a page and click **📟 On CrowPanel** (under the
 reads **YES** — up to 4 pages. Press
 **Save** — the panel's first four tabs update within a second or two (first 12 buttons
 of each page, 4×3). Rename, reorder, add or remove buttons the same way; nothing to flash.
-Needs CrowPanel firmware 3.x and the HA package 3.0.0. The footer shows
+Needs CrowPanel firmware 3.x and the HA package 3.0.0.
+
+**Home screen:** in ✎ Edit layout, click **🏠 CrowPanel home screen…** to pick up to 8 favourite
+buttons, set how many seconds an idle page waits before returning home (the Music page never
+does; 0 = never), and choose a temperature to show. Needs firmware 3.2.0 + HA package 3.1.0. The footer shows
 "📟 CrowPanel layout sent HH:MM" after each update.
 
 ## Music tab

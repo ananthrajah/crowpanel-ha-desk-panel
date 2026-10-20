@@ -32,6 +32,8 @@ DEFAULT_CONFIG = {
     "pages": [
         {"name": "Page 1", "panel": True, "tiles": []},
     ],
+    # CrowPanel home screen (firmware 3.2+, HA package 3.1+)
+    "home": {"tiles": [], "timeout": 30, "temp_entity": ""},
     "music": {
         "enabled": True,
         "player": "",  # empty = first Music Assistant player found

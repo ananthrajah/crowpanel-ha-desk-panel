@@ -1,5 +1,11 @@
 # Changelog — Desk Panel Tray
 
+## 0.3.0 — 2026-10-20
+- **CrowPanel home screen.** Edit layout → "🏠 CrowPanel home screen…": pick up to 8 favourite
+  buttons, how long an idle page waits before going back home (0 = never; the Music page
+  never times out) and which temperature to show. Sent to HA with the pages
+  (needs HA package 3.1.0 and panel firmware 3.2.0).
+
 ## 0.2.2 — 2026-10-18
 - Public release clean-up: first run starts with one empty page and asks for your HA URL;
   no personal entities in the defaults.

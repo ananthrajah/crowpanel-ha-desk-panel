@@ -80,8 +80,13 @@ class FakeHA:
                     self.calls.append(m)
                     await ws.send(json.dumps({"id": mid, "type": "result", "success": True, "result": {}}))
                     if m.get("event_type") == "desk_panel_layout_set":  # what HA package 3.0 does
+                        ed = m.get("event_data", {})
+                        h = ed.get("home") or {}
                         await self.push(_st("sensor.desk_panel_layout_store", "2026-10-18T00:00:00",
-                                            pages=m.get("event_data", {}).get("pages", [])))
+                                            pages=ed.get("pages", []),
+                                            home={"tiles": h.get("tiles", [])[:8],
+                                                  "timeout": max(0, min(600, int(h.get("timeout", 30)))),
+                                                  "temp_entity": h.get("temp_entity", "") or ""}))
         finally:
             self._clients.discard(ws)
 

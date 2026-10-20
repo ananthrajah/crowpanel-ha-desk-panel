@@ -1,12 +1,19 @@
 # ═════════════════════════════════════════════════════════════════════════════
 # Desk Panel — Home Assistant package
-# VERSION: 3.0.0   (2026-10-18)   Pairs with crowpanel-desk.yaml v3.x · desktop app v0.2+
+# VERSION: 3.1.0   (2026-10-20)   Pairs with crowpanel-desk.yaml v3.x · desktop app v0.2+
 # Project page: https://github.com/ananthrajah/crowpanel-ha-desk-panel
 # Install as /config/packages/desk_panel.yaml (replace the old file), then
 # Developer Tools > YAML > "Check configuration", then restart HA (first time
 # only for the new script/template entities; later edits just need a reload).
 #
 # CHANGELOG
+#   3.1.0  2026-10-20  Home screen for panel firmware 3.2: the desktop app now also sends
+#                      `home: {tiles, timeout, temp_entity}` - up to 8 favourite buttons,
+#                      seconds before an idle page returns home (0 = never) and a
+#                      temperature entity. New home_* attributes on sensor.desk_panel_layout.
+#   3.0.1  2026-10-19  Fix: on/off strings for the panel (pN_states) were turned into numbers
+#                      by HA, dropping leading zeros, so a page whose first button was off
+#                      showed the wrong buttons green. A trailing '|' keeps them as text.
 #   3.0.0  2026-10-18  Panel layout from the desktop app: sensor.desk_panel_layout_store
 #                      (saved by the app via the desk_panel_layout_set event; survives
 #                      restarts), sensor.desk_panel_layout (compact per-page labels /
@@ -331,6 +338,17 @@ template:
               {% set ns.out = ns.out + [{'name': (pg.name or '') | string, 'tiles': tl.t}] %}
             {% endfor %}
             {{ ns.out }}
+          # 3.1.0: home screen (favourites, return-to-home timeout, temperature)
+          home: >-
+            {% set h = trigger.event.data.home if trigger.event.data.home is mapping else {} %}
+            {% set tl = namespace(t=[]) %}
+            {% for t in (h.tiles or [])[:8] %}
+              {% if t.entity_id is defined and t.entity_id %}
+                {% set tl.t = tl.t + [{'entity_id': t.entity_id | string, 'label': (t.label or '') | string}] %}
+              {% endif %}
+            {% endfor %}
+            {% set to = h.timeout | int(30) if h.timeout is defined else 30 %}
+            {{ {'tiles': tl.t, 'timeout': [[to, 0] | max, 600] | min, 'temp_entity': (h.temp_entity or '') | string} }}
 
   # Compact, live view of the layout for the panel: per page a name, newline-joined
   # labels + entity_ids, and one char per button: 1 = on, 0 = off, x = unavailable.
@@ -353,7 +371,7 @@ template:
             {{ ns.l | join("\n") }}
           p1_states: >-
             {% set pages = state_attr('sensor.desk_panel_layout_store', 'pages') or [] %}{% set tiles = pages[0].tiles if pages | count > 0 else [] %}
-            {% for t in tiles %}{% set s = states(t.entity_id) %}{{ '1' if s in ['on', 'open', 'opening', 'playing', 'unlocked', 'heat', 'cool', 'heat_cool', 'auto', 'dry', 'fan_only', 'home'] else ('x' if s in ['unavailable', 'unknown'] else '0') }}{% endfor %}
+            {% for t in tiles %}{% set s = states(t.entity_id) %}{{ '1' if s in ['on', 'open', 'opening', 'playing', 'unlocked', 'heat', 'cool', 'heat_cool', 'auto', 'dry', 'fan_only', 'home'] else ('x' if s in ['unavailable', 'unknown'] else '0') }}{% endfor %}|
           p2_name: >-
             {% set pages = state_attr('sensor.desk_panel_layout_store', 'pages') or [] %}
             {{ (pages[1].name if pages | count > 1 else '') | regex_replace('[^ -~]', '') | trim }}
@@ -367,7 +385,7 @@ template:
             {{ ns.l | join("\n") }}
           p2_states: >-
             {% set pages = state_attr('sensor.desk_panel_layout_store', 'pages') or [] %}{% set tiles = pages[1].tiles if pages | count > 1 else [] %}
-            {% for t in tiles %}{% set s = states(t.entity_id) %}{{ '1' if s in ['on', 'open', 'opening', 'playing', 'unlocked', 'heat', 'cool', 'heat_cool', 'auto', 'dry', 'fan_only', 'home'] else ('x' if s in ['unavailable', 'unknown'] else '0') }}{% endfor %}
+            {% for t in tiles %}{% set s = states(t.entity_id) %}{{ '1' if s in ['on', 'open', 'opening', 'playing', 'unlocked', 'heat', 'cool', 'heat_cool', 'auto', 'dry', 'fan_only', 'home'] else ('x' if s in ['unavailable', 'unknown'] else '0') }}{% endfor %}|
           p3_name: >-
             {% set pages = state_attr('sensor.desk_panel_layout_store', 'pages') or [] %}
             {{ (pages[2].name if pages | count > 2 else '') | regex_replace('[^ -~]', '') | trim }}
@@ -381,7 +399,7 @@ template:
             {{ ns.l | join("\n") }}
           p3_states: >-
             {% set pages = state_attr('sensor.desk_panel_layout_store', 'pages') or [] %}{% set tiles = pages[2].tiles if pages | count > 2 else [] %}
-            {% for t in tiles %}{% set s = states(t.entity_id) %}{{ '1' if s in ['on', 'open', 'opening', 'playing', 'unlocked', 'heat', 'cool', 'heat_cool', 'auto', 'dry', 'fan_only', 'home'] else ('x' if s in ['unavailable', 'unknown'] else '0') }}{% endfor %}
+            {% for t in tiles %}{% set s = states(t.entity_id) %}{{ '1' if s in ['on', 'open', 'opening', 'playing', 'unlocked', 'heat', 'cool', 'heat_cool', 'auto', 'dry', 'fan_only', 'home'] else ('x' if s in ['unavailable', 'unknown'] else '0') }}{% endfor %}|
           p4_name: >-
             {% set pages = state_attr('sensor.desk_panel_layout_store', 'pages') or [] %}
             {{ (pages[3].name if pages | count > 3 else '') | regex_replace('[^ -~]', '') | trim }}
@@ -395,4 +413,26 @@ template:
             {{ ns.l | join("\n") }}
           p4_states: >-
             {% set pages = state_attr('sensor.desk_panel_layout_store', 'pages') or [] %}{% set tiles = pages[3].tiles if pages | count > 3 else [] %}
-            {% for t in tiles %}{% set s = states(t.entity_id) %}{{ '1' if s in ['on', 'open', 'opening', 'playing', 'unlocked', 'heat', 'cool', 'heat_cool', 'auto', 'dry', 'fan_only', 'home'] else ('x' if s in ['unavailable', 'unknown'] else '0') }}{% endfor %}
+            {% for t in tiles %}{% set s = states(t.entity_id) %}{{ '1' if s in ['on', 'open', 'opening', 'playing', 'unlocked', 'heat', 'cool', 'heat_cool', 'auto', 'dry', 'fan_only', 'home'] else ('x' if s in ['unavailable', 'unknown'] else '0') }}{% endfor %}|
+          # 3.1.0: home screen
+          home_timeout: >-
+            {{ (state_attr('sensor.desk_panel_layout_store', 'home') or {}).timeout | default(30) | int(30) }}
+          home_entities: >-
+            {% set tiles = (state_attr('sensor.desk_panel_layout_store', 'home') or {}).tiles or [] %}
+            {{ tiles | map(attribute='entity_id') | join("\n") }}
+          home_labels: >-
+            {% set tiles = (state_attr('sensor.desk_panel_layout_store', 'home') or {}).tiles or [] %}
+            {% set ns = namespace(l=[]) %}
+            {% for t in tiles %}{% set ns.l = ns.l + [((t.label or state_attr(t.entity_id, 'friendly_name') or t.entity_id) | regex_replace('[^ -~]', '') | trim)[:22]] %}{% endfor %}
+            {{ ns.l | join("\n") }}
+          home_states: >-
+            {% set tiles = (state_attr('sensor.desk_panel_layout_store', 'home') or {}).tiles or [] %}
+            {% for t in tiles %}{% set s = states(t.entity_id) %}{{ '1' if s in ['on', 'open', 'opening', 'playing', 'unlocked', 'heat', 'cool', 'heat_cool', 'auto', 'dry', 'fan_only', 'home'] else ('x' if s in ['unavailable', 'unknown'] else '0') }}{% endfor %}|
+          home_temp: >-
+            {% set e = (state_attr('sensor.desk_panel_layout_store', 'home') or {}).temp_entity or '' %}
+            {% if e.startswith('climate.') %}{% set v = state_attr(e, 'current_temperature') %}{% else %}{% set v = states(e) %}{% endif %}
+            {% if e and v is not none and v | is_number %}{{ '%.1f' | format(v | float) }}°{% else %} {% endif %}
+          home_temp_name: >-
+            {% set e = (state_attr('sensor.desk_panel_layout_store', 'home') or {}).temp_entity or '' %}
+            {% set sp = state_attr(e, 'temperature') if e.startswith('climate.') else none %}
+            {% if e %}{{ ((state_attr(e, 'friendly_name') or e) | regex_replace('[^ -~]', '') | trim)[:24] }}{% if sp is number %} - set {{ sp }}°{% endif %}{% else %} {% endif %}

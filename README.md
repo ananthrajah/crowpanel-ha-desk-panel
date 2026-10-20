@@ -4,6 +4,9 @@ A Home Assistant desk touch panel for the **Elecrow CrowPanel 7" Basic (ESP32-S3
 ESPHome + LVGL, plus an optional **Windows tray app** that edits the panel's buttons live. You never have to
 reflash to change a button.
 
+- **Home screen:** clock + date, temperature, now-playing strip, up to 8 favourite buttons and
+  shortcuts to every page. Idle pages (except Music) return home after a timeout you set in the
+  desktop app; sleeping also returns home.
 - **4 button pages** (4×3 = 12 buttons each) for lights, switches, scenes, scripts, fans and covers.
   Green = on, black = off, dimmed = unavailable. Buttons always match HA: they repaint on boot, on
   reconnect, on wake, every 5 s and right after a tap.
@@ -40,16 +43,17 @@ desktop app. In that case you set the layout by firing the event yourself (see
 
 | Folder | What | Version |
 |---|---|---|
-| [`firmware/`](firmware) | ESPHome YAML + 2 small C++ headers for the CrowPanel | 3.0.1 |
-| [`home-assistant/`](home-assistant) | HA package (`desk_panel.yaml`) | 3.0.0 |
-| [`desktop-app/`](desktop-app) | Windows tray app (Python / PySide6) | 0.2.2 |
+| [`firmware/`](firmware) | ESPHome YAML + 2 small C++ headers for the CrowPanel | 3.2.0 |
+| [`home-assistant/`](home-assistant) | HA package (`desk_panel.yaml`) | 3.1.0 |
+| [`desktop-app/`](desktop-app) | Windows tray app (Python / PySide6) | 0.3.0 |
+| [`enclosure/`](enclosure) | 3D-printable housing + 20° desk stand with a top-right volume knob | 1.0.0 |
 
 ## Hardware
 
 - Elecrow CrowPanel 7.0" **Basic** HMI display, ESP32-S3 N4R8, 800×480, GT911 touch, **board V3.0**.
   Other board revisions should work, but the touch fixes below are specific to V3.0.
 - USB-C cable and 5 V / 2 A power. No battery is needed.
-- A stand or case: there are several free CrowPanel 7" desk stands on MakerWorld / Printables.
+- A case: print the one in [`enclosure/`](enclosure) (housing + desk stand + knob, no supports).
 - Optional: an EC11 rotary encoder (KY-040 module) on the HY2.0 header as a volume knob. There's a
   commented-out stub at the bottom of the firmware.
 
